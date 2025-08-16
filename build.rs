@@ -22,7 +22,7 @@ fn main() {
         .and_then(|v| v.get("package").cloned())
         .and_then(|p| p.get("metadata").cloned())
         .and_then(|m| m.get("my_custom_tool").cloned())
-        .and_then(|t| t.get("copywriteyear").cloned())
+        .and_then(|t| t.get("copyrightyear").cloned())
         .and_then(|y| y.as_str().map(|s| s.to_string()))
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "2025".to_string());

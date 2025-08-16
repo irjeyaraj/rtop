@@ -30,4 +30,3 @@ The format is Keep a Changelog–inspired, with dates in YYYY-MM-DD.
 ## [0.1.0] - 2025-07-XX
 - Initial release with dashboard, top/htop-like process pane, and shell tab.
 
-[0.1.2]: https://example.com/rtop/releases/0.1.2
