@@ -68,7 +68,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -197,16 +201,21 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
             }
         })?;
 
+
         // Handle input with non-blocking poll, but ensure a minimum tick rate
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_millis(0));
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(key, &mut app)? {
-                    break; // exit
+            match event::read()? {
+                Event::Key(key) => {
+                    if handle_key(key, &mut app)? { break; }
                 }
+                Event::Resize(_, _) => {
+                    // nothing specific; redraw handles layout
+                }
+                _ => {}
             }
         }
         if last_tick.elapsed() >= tick_rate {
@@ -257,6 +266,19 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         (KeyCode::Right, _) => {
             if app.selected_top_tab < 2 { app.selected_top_tab += 1; }
         }
+        // Vim-style: h = left, l = right (disabled on Shell tab to allow typing)
+        (KeyCode::Char('h'), _) if app.selected_top_tab != 2 => {
+            if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
+        }
+        (KeyCode::Char('H'), _) if app.selected_top_tab != 2 => {
+            if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
+        }
+        (KeyCode::Char('l'), _) if app.selected_top_tab != 2 => {
+            if app.selected_top_tab < 2 { app.selected_top_tab += 1; }
+        }
+        (KeyCode::Char('L'), _) if app.selected_top_tab != 2 => {
+            if app.selected_top_tab < 2 { app.selected_top_tab += 1; }
+        }
         (KeyCode::Tab, _) => {
             app.selected_top_tab = (app.selected_top_tab + 1) % 3;
         }
@@ -279,6 +301,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
     }
     Ok(false)
 }
+
 
 // GPU detection helpers (Linux, best-effort via /sys/class/drm and /proc)
 /// Basic GPU information detected from the system (Linux best-effort).
@@ -1941,11 +1964,11 @@ fn draw_help_popup(f: &mut ratatui::Frame<'_>, size: Rect) {
     // Build help text lines (multiline with indentation)
     let lines = vec![
         Line::from(Span::raw(format!("{} v {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))),
-        Line::from(Span::raw(format!("© 2025 {}", env!("CARGO_PKG_AUTHORS")))), 
+        Line::from(Span::raw(format!("© {} {}", env!("RTOP_COPYRIGHT_YEAR"), env!("CARGO_PKG_AUTHORS")))), 
         Line::from(Span::raw(format!("License: {}", env!("CARGO_PKG_LICENSE")))),
         Line::from(Span::raw(" ")),
         Line::from(Span::raw("Navigation and hotkeys:")),
-        Line::from(Span::raw("    - Left/Right, Tab/BackTab, or 1/2/3 to switch top tabs.")),
+        Line::from(Span::raw("    - Left/Right, h/l, Tab/BackTab, or 1/2/3 to switch top tabs.")),
         Line::from(Span::raw("    - Home Dashboard, End last tab, PgDn previous tab, PgUp next tab.")),
         Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F12 Shell tab.")), 
         Line::from(Span::raw("    - F10 exit app.")), 

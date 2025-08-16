@@ -1,11 +1,14 @@
 [package]
 name = "rtop"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 authors = ["Immanuel Raja Jeyaraj <irj@sefier.com>"]
 license = "GPL-2.0-or-later"
 description = "A lightweight terminal system monitor (TUI) for Linux"
 readme = "README.md"
+
+[package.metadata.my_custom_tool]
+copywriteyear = "2025"
 
 [dependencies]
 crossterm = "0.28.1"
@@ -13,3 +16,6 @@ ratatui = "0.28.1"
 sysinfo = "0.30.13"
 portable-pty = "0.8.1"
 strip-ansi-escapes = "0.2.1"
+
+[build-dependencies]
+toml = "0.8"

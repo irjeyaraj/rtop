@@ -31,13 +31,13 @@ Run the executable in your terminal:
 
 Press F1 at any time to bring up in-app help.
 
-### Keybindings (summary)
-- Switch top tabs: Left/Right, Tab/BackTab, or 1/2/3
+### Controls (summary)
+- Switch top tabs: Left/Right, h/l, Tab/BackTab, or 1/2/3
 - Quick navigation: Home (Dashboard), End (last tab), PgDn (previous tab), PgUp (next tab)
 - Direct tab shortcuts: F2 (Dashboard), F3 (top/htop), F12 (Shell)
 - Exit: F10, or press `q` or `Ctrl-C`
 
-Note: The vim-style `h`/`l` keys are not used for tab navigation.
+Note: On the Shell tab, printable typing (letters, numbers, etc.), Enter, Backspace, and Tab are forwarded to the embedded shell. Vim-style `h`/`l` navigation is disabled there so you can type normally.
 
 ## Shell tab
 The Shell tab embeds a PTY: printable characters, Enter, Backspace, and Tab are forwarded to the PTY while on the Shell tab.
