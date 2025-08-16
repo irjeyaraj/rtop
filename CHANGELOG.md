@@ -8,8 +8,12 @@ The format is Keep a Changelog–inspired, with dates in YYYY-MM-DD.
 - Feature: Embedded Shell tab implemented using a PTY; the shell runs inside the Shell tab.
 - Input: While in Shell, most keys are forwarded to the shell; Ctrl-C goes to the shell (F10 still exits the app).
 - UX: PTY resizes on terminal resize; leaving the Shell tab terminates the session to avoid leaks.
-- Cleanup: Removed unused legacy run_system_shell() and related code; cleared compiler warnings.
-- Docs: README and in-app Help updated for embedded shell behavior.
+- Services: Added “Services (SystemD)” tab (F4) with a scrollable table of all services, colored status, and Enter-to-view details popup.
+- Processes: top/htop tab now shows a scrollable, selectable table with Enter-to-view details popup.
+- Logs: Added Logs tab (F5). Recursively lists /var/log in a scrollable table; Enter opens a popup with contents. If permission is denied, a sudo password prompt is shown and used to read the file.
+- Dashboard: Added Applications frame (Apache2, Nginx, Postgresql, Mysql, Podman, Docker) with Active/Installed detection; rearranged with GPU panel.
+- Cleanup: Fixed an unused import warning by simplifying fmt_system_time; minor refactors and bounds checks.
+- Docs: Updated in-app Help and README to reflect new tabs and hotkeys.
 
 ## [0.1.3] - 2025-08-16
 - Optimization: Cache GPU detection at startup instead of every frame.

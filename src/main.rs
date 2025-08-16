@@ -4,6 +4,8 @@
 use std::error::Error;
 use std::io;
 use std::time::{Duration, Instant};
+use std::process::Command;
+use std::process::Stdio;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -11,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, Block, Borders, Clear};
+use ratatui::widgets::{Gauge, Block, Borders, Clear, Table, Row, Cell};
 use ratatui::Terminal;
 use sysinfo::{CpuRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use std::fs;
@@ -119,7 +121,7 @@ impl ShellSession {
 /// Fields capture the current UI selection and popup states, as well as cached
 /// detection results to reduce per-frame workload.
 struct App {
-    selected_top_tab: usize, // 0: Dashboard, 1: top/htop, 2: Shell
+    selected_top_tab: usize, // 0: Dashboard, 1: top/htop, 2: Services, 3: Shell
     #[allow(dead_code)]
     selected_proc_tab: usize, // reserved (no Process tab)
     // Help popup state
@@ -132,6 +134,35 @@ struct App {
     gpus: Vec<GpuInfo>,
     // Embedded shell session (PTY) for the Shell tab
     shell: Option<ShellSession>,
+    // Services tab state
+    services_scroll: usize, // top visible row index
+    services_selected: usize, // absolute selected row index
+    // Service details popup state
+    service_popup: bool,
+    service_detail_title: String,
+    service_detail_text: String,
+    // Processes (top/htop) tab state
+    procs_scroll: usize, // top visible row index
+    procs_selected: usize, // absolute selected row index among sorted list
+    // Process details popup state
+    process_popup: bool,
+    process_detail_title: String,
+    process_detail_text: String,
+    // Cached list of process PIDs sorted by CPU (rebuilt each tick)
+    procs_pids_sorted: Vec<i32>,
+    // Logs tab state
+    logs_scroll: usize,
+    logs_selected: usize,
+    // Log content popup state
+    log_popup: bool,
+    log_detail_title: String,
+    log_detail_text: String,
+    // Sudo password prompt state for Logs
+    logs_password_prompt: bool,
+    logs_password_input: String,
+    logs_password_error: String,
+    logs_sudo_password: Option<String>,
+    logs_pending_path: String, // path awaiting sudo read
 }
 
 /// Construct the initial application state.
@@ -146,6 +177,27 @@ impl Default for App {
             net_last: Instant::now(),
             gpus: Vec::new(),
             shell: None,
+            services_scroll: 0,
+            services_selected: 0,
+            service_popup: false,
+            service_detail_title: String::new(),
+            service_detail_text: String::new(),
+            procs_scroll: 0,
+            procs_selected: 0,
+            process_popup: false,
+            process_detail_title: String::new(),
+            process_detail_text: String::new(),
+            procs_pids_sorted: Vec::new(),
+            logs_scroll: 0,
+            logs_selected: 0,
+            log_popup: false,
+            log_detail_title: String::new(),
+            log_detail_text: String::new(),
+            logs_password_prompt: false,
+            logs_password_input: String::new(),
+            logs_password_error: String::new(),
+            logs_sudo_password: None,
+            logs_pending_path: String::new(),
         }
     }
 }
@@ -239,6 +291,25 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
         sys.refresh_processes(ProcessesToUpdate::All, true);
         sys.refresh_memory();
 
+        // Build processes cache: PIDs sorted by CPU% (descending)
+        {
+            let mut pairs: Vec<(i32, f32)> = sys
+                .processes()
+                .iter()
+                .map(|(pid, p)| (pid.as_u32() as i32, p.cpu_usage()))
+                .collect();
+            pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            app.procs_pids_sorted = pairs.into_iter().map(|(pid, _)| pid).collect();
+            // Clamp selection to available items
+            if !app.procs_pids_sorted.is_empty() {
+                let max_idx = app.procs_pids_sorted.len().saturating_sub(1);
+                if app.procs_selected > max_idx { app.procs_selected = max_idx; }
+            } else {
+                app.procs_selected = 0;
+                app.procs_scroll = 0;
+            }
+        }
+
         // Draw UI
         terminal.draw(|f| {
             let size = f.area();
@@ -258,6 +329,18 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
             if app.help_popup {
                 draw_help_popup(f, size);
             }
+            if app.service_popup {
+                draw_service_popup(f, size, &app.service_detail_title, &app.service_detail_text);
+            }
+            if app.process_popup {
+                draw_process_popup(f, size, &app.process_detail_title, &app.process_detail_text);
+            }
+            if app.log_popup {
+                draw_log_popup(f, size, &app.log_detail_title, &app.log_detail_text);
+            }
+            if app.logs_password_prompt {
+                draw_logs_password_prompt(f, size, &app.logs_password_error, app.logs_password_input.chars().count());
+            }
         })?;
 
 
@@ -272,7 +355,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
                     if handle_key(key, &mut app)? { break; }
                 }
                 Event::Resize(_, _) => {
-                    if app.selected_top_tab == 2 {
+                    if app.selected_top_tab == 3 {
                         if let Some(sess) = app.shell.as_mut() {
                             // Approximate inner area: full size minus menu and borders
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -306,9 +389,83 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
             return Ok(false);
         }
     }
+    // Close service details popup on Esc or Enter
+    if app.service_popup {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.service_popup = false;
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+    // Close process details popup on Esc or Enter
+    if app.process_popup {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.process_popup = false;
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+    // Close log content popup on Esc or Enter
+    if app.log_popup {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.log_popup = false;
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+    // Handle sudo password prompt input
+    if app.logs_password_prompt {
+        match key.code {
+            KeyCode::Esc => {
+                app.logs_password_prompt = false;
+                app.logs_password_input.clear();
+                app.logs_password_error.clear();
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                if app.logs_password_input.is_empty() {
+                    app.logs_password_error = "Password cannot be empty".to_string();
+                } else {
+                    app.logs_sudo_password = Some(app.logs_password_input.clone());
+                    app.logs_password_input.clear();
+                    app.logs_password_error.clear();
+                    app.logs_password_prompt = false;
+                    // If we have a pending path, attempt to read now and show
+                    if !app.logs_pending_path.is_empty() {
+                        let path = app.logs_pending_path.clone();
+                        let title = std::path::Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).to_string();
+                        match read_log_file_best_effort(&path, app.logs_sudo_password.as_deref()) {
+                            Ok(text) => { app.log_detail_title = title; app.log_detail_text = text; app.log_popup = true; }
+                            Err(err) => { app.log_detail_title = title; app.log_detail_text = format!("Failed to read: {}", err); app.log_popup = true; }
+                        }
+                        app.logs_pending_path.clear();
+                    }
+                }
+                return Ok(false);
+            }
+            KeyCode::Backspace => {
+                app.logs_password_input.pop();
+                return Ok(false);
+            }
+            KeyCode::Char(c) => {
+                // basic acceptance of printable chars
+                if !c.is_control() {
+                    app.logs_password_input.push(c);
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
 
     // If Shell tab active, forward most keys to the PTY instead of handling as app hotkeys
-    if app.selected_top_tab == 2 {
+    if app.selected_top_tab == 3 {
         // Ensure shell session exists
         if app.shell.is_none() {
             // Spawn with a reasonable default size; will be resized on draw
@@ -358,6 +515,122 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         }
     }
 
+    // Selection and actions for top/htop Processes table
+    if app.selected_top_tab == 1 {
+        match key.code {
+            KeyCode::Up => {
+                if app.procs_selected > 0 { app.procs_selected -= 1; }
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                app.procs_selected = app.procs_selected.saturating_add(1);
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                if !app.procs_pids_sorted.is_empty() {
+                    let idx = app.procs_selected.min(app.procs_pids_sorted.len().saturating_sub(1));
+                    let pid = app.procs_pids_sorted[idx];
+                    let title = get_process_name(pid);
+                    let text = get_process_details(pid);
+                    app.process_detail_title = if title.is_empty() { format!("PID {}", pid) } else { format!("{} (PID {})", title, pid) };
+                    app.process_detail_text = text;
+                    app.process_popup = true;
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
+    // Selection and actions for Services tab
+    if app.selected_top_tab == 2 {
+        match key.code {
+            KeyCode::Up => {
+                if app.services_selected > 0 { app.services_selected -= 1; }
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                // Increase selection but cap to last item based on current listing (best effort)
+                #[cfg(target_os = "linux")]
+                {
+                    let total = get_all_services().len();
+                    if total == 0 { /* no-op */ }
+                    else {
+                        let max_idx = total.saturating_sub(1);
+                        if app.services_selected < max_idx { app.services_selected += 1; }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // nothing to select on non-linux view
+                }
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                // Open popup with selected service details
+                #[cfg(target_os = "linux")]
+                {
+                    let services = get_all_services();
+                    if !services.is_empty() {
+                        let idx = app.services_selected.min(services.len().saturating_sub(1));
+                        let (unit, _active, _desc) = &services[idx];
+                        app.service_detail_title = unit.clone();
+                        app.service_detail_text = get_service_status(unit);
+                        app.service_popup = true;
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    app.service_detail_title = String::from("N/A");
+                    app.service_detail_text = String::from("Service details are supported on Linux only.");
+                    app.service_popup = true;
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
+    // Selection and actions for Logs tab
+    if app.selected_top_tab == 4 {
+        match key.code {
+            KeyCode::Up => { if app.logs_selected > 0 { app.logs_selected -= 1; } return Ok(false); }
+            KeyCode::Down => { app.logs_selected = app.logs_selected.saturating_add(1); return Ok(false); }
+            KeyCode::Enter => {
+                // Build file list and attempt to read selected file
+                let files = list_var_log_files();
+                if !files.is_empty() {
+                    let idx = app.logs_selected.min(files.len().saturating_sub(1));
+                    let ent = &files[idx];
+                    // Try normal read first, then sudo if we have password; if denied and no password, prompt
+                    match read_log_file_best_effort(&ent.path, app.logs_sudo_password.as_deref()) {
+                        Ok(text) => {
+                            app.log_detail_title = ent.name.clone();
+                            app.log_detail_text = text;
+                            app.log_popup = true;
+                        }
+                        Err(err) => {
+                            // If error suggests permission denied and no password yet, open prompt
+                            // We cannot reliably parse OS error text; if we have no password, prompt anyway
+                            if app.logs_sudo_password.is_none() {
+                                app.logs_pending_path = ent.path.clone();
+                                app.logs_password_prompt = true;
+                                app.logs_password_error.clear();
+                            } else {
+                                // Show error in popup
+                                app.log_detail_title = ent.name.clone();
+                                app.log_detail_text = format!("Failed to read: {}", err);
+                                app.log_popup = true;
+                            }
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), _) => return Ok(true),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
@@ -367,53 +640,55 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         (KeyCode::F(1), _) => { app.help_popup = !app.help_popup; } // F1 Help popup
         (KeyCode::F(2), _) => { app.selected_top_tab = 0; } // F2 Dashboard
         (KeyCode::F(3), _) => { app.selected_top_tab = 1; } // F3 top/htop
-        // F4 intentionally left unmapped
-        // F5 intentionally left unmapped
+        (KeyCode::F(4), _) => { app.selected_top_tab = 2; } // F4 Services (SystemD)
+        (KeyCode::F(5), _) => { app.selected_top_tab = 4; } // F5 Logs
         // F6 intentionally left unmapped
         (KeyCode::F(11), _) => { /* intentionally unmapped */ }
-        (KeyCode::F(12), _) => { app.selected_top_tab = 2; } // F12 Shell tab
+        (KeyCode::F(12), _) => { app.selected_top_tab = 3; } // F12 Shell tab
         // Top tabs navigation
         (KeyCode::Home, _) => { app.selected_top_tab = 0; } // Home -> Dashboard
-        (KeyCode::End, _) => { app.selected_top_tab = 2; }  // End -> last tab (Shell)
+        (KeyCode::End, _) => { app.selected_top_tab = 4; }  // End -> last tab (Logs)
         (KeyCode::PageDown, _) => { // PgDn -> move backward (previous tab)
-            app.selected_top_tab = (app.selected_top_tab + 2) % 3; // -1 mod 3
+            app.selected_top_tab = (app.selected_top_tab + 4) % 5; // -1 mod 5
         }
         (KeyCode::PageUp, _) => { // PgUp -> move forward (next tab)
-            app.selected_top_tab = (app.selected_top_tab + 1) % 3;
+            app.selected_top_tab = (app.selected_top_tab + 1) % 5;
         }
         (KeyCode::Left, _) => {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
         (KeyCode::Right, _) => {
-            if app.selected_top_tab < 2 { app.selected_top_tab += 1; }
+            if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
         }
         // Vim-style: h = left, l = right (disabled on Shell tab to allow typing)
-        (KeyCode::Char('h'), _) if app.selected_top_tab != 2 => {
+        (KeyCode::Char('h'), _) if app.selected_top_tab != 3 => {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
-        (KeyCode::Char('H'), _) if app.selected_top_tab != 2 => {
+        (KeyCode::Char('H'), _) if app.selected_top_tab != 3 => {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
-        (KeyCode::Char('l'), _) if app.selected_top_tab != 2 => {
-            if app.selected_top_tab < 2 { app.selected_top_tab += 1; }
+        (KeyCode::Char('l'), _) if app.selected_top_tab != 3 => {
+            if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
         }
-        (KeyCode::Char('L'), _) if app.selected_top_tab != 2 => {
-            if app.selected_top_tab < 2 { app.selected_top_tab += 1; }
+        (KeyCode::Char('L'), _) if app.selected_top_tab != 3 => {
+            if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
         }
         (KeyCode::Tab, _) => {
-            app.selected_top_tab = (app.selected_top_tab + 1) % 3;
+            app.selected_top_tab = (app.selected_top_tab + 1) % 5;
         }
         (KeyCode::BackTab, _) => {
-            app.selected_top_tab = (app.selected_top_tab + 2) % 3; // equivalent to -1 mod 3
+            app.selected_top_tab = (app.selected_top_tab + 4) % 5; // equivalent to -1 mod 5
         }
         (KeyCode::Char('1'), _) => { app.selected_top_tab = 0; }
         (KeyCode::Char('2'), _) => { app.selected_top_tab = 1; }
         (KeyCode::Char('3'), _) => { app.selected_top_tab = 2; }
+        (KeyCode::Char('4'), _) => { app.selected_top_tab = 3; }
+        (KeyCode::Char('5'), _) => { app.selected_top_tab = 4; }
         _ => {}
     }
 
     // If we just left the Shell tab, terminate the session
-    if app.selected_top_tab != 2 {
+    if app.selected_top_tab != 3 {
         if let Some(mut sess) = app.shell.take() { sess.terminate(); }
     }
 
@@ -809,6 +1084,20 @@ fn fmt_bytes_gib(bytes: u64) -> String {
     }
 }
 
+fn fmt_bytes(bytes: u64) -> String {
+    // Human readable bytes: uses binary units
+    let mut v = bytes as f64;
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < units.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if v >= 100.0 { format!("{:.0} {}", v, units[i]) }
+    else if v >= 10.0 { format!("{:.1} {}", v, units[i]) }
+    else { format!("{:.2} {}", v, units[i]) }
+}
+
 #[cfg(target_os = "linux")]
 fn list_disks_best_effort() -> Vec<DiskInfo> {
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
@@ -943,6 +1232,372 @@ fn read_network_counters() -> Vec<(String, u64, u64)> {
 #[cfg(not(target_os = "linux"))]
 fn read_network_counters() -> Vec<(String, u64, u64)> { Vec::new() }
 
+// All services listing (Linux)
+#[cfg(target_os = "linux")]
+fn get_all_services() -> Vec<(String, String, String)> {
+    // Use systemctl to list all services without pager/legend
+    let output = Command::new("systemctl")
+        .args(["list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        .output();
+    let mut services: Vec<(String, String, String)> = Vec::new();
+    if let Ok(out) = output {
+        if out.status.success() {
+            if let Ok(text) = String::from_utf8(out.stdout) {
+                for line in text.lines() {
+                    let l = line.trim();
+                    if l.is_empty() { continue; }
+                    // Expected columns: UNIT LOAD ACTIVE SUB DESCRIPTION
+                    let toks: Vec<&str> = l.split_whitespace().collect();
+                    if toks.len() >= 5 {
+                        let unit = toks[0].to_string();
+                        let active = toks[2].to_string();
+                        let desc = toks[4..].join(" ");
+                        services.push((unit, active, desc));
+                    }
+                }
+            }
+        }
+    }
+    // Sort by unit name for stable display
+    services.sort_by(|a, b| a.0.cmp(&b.0));
+    services
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_all_services() -> Vec<(String, String, String)> { Vec::new() }
+
+// Fetch detailed status text for a service (Linux)
+#[cfg(target_os = "linux")]
+fn get_service_status(unit: &str) -> String {
+    let output = Command::new("systemctl")
+        .args(["status", unit, "--no-pager", "--full"]) 
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout).unwrap_or_else(|_| String::from("(failed to decode output)")),
+        Ok(out) => {
+            let mut s = String::new();
+            if !out.stdout.is_empty() {
+                s = String::from_utf8_lossy(&out.stdout).into_owned();
+            }
+            if !out.stderr.is_empty() {
+                if !s.is_empty() { s.push_str("\n"); }
+                s.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            if s.is_empty() { s = String::from("(no output)"); }
+            s
+        }
+        Err(_) => String::from("systemctl not available or failed to execute."),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_service_status(_unit: &str) -> String { String::from("Service details are supported on Linux only.") }
+
+// -------- Process details helpers (Linux best-effort) --------
+#[cfg(target_os = "linux")]
+fn get_process_name(pid: i32) -> String {
+    let comm_path = format!("/proc/{}/comm", pid);
+    if let Ok(s) = std::fs::read_to_string(&comm_path) {
+        let name = s.trim();
+        if !name.is_empty() { return name.to_string(); }
+    }
+    let status_path = format!("/proc/{}/status", pid);
+    if let Ok(s) = std::fs::read_to_string(&status_path) {
+        if let Some(line) = s.lines().find(|l| l.starts_with("Name:")) {
+            return line[5..].trim().to_string();
+        }
+    }
+    String::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_process_name(_pid: i32) -> String { String::new() }
+
+#[cfg(target_os = "linux")]
+fn get_process_details(pid: i32) -> String {
+    use std::path::PathBuf;
+    let mut out = String::new();
+    let status_path = format!("/proc/{}/status", pid);
+    let stat_path = format!("/proc/{}/stat", pid);
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    let exe_path = PathBuf::from(format!("/proc/{}/exe", pid));
+    let cwd_path = PathBuf::from(format!("/proc/{}/cwd", pid));
+
+    // Name, State, PPID, Uid, Gid, Threads, VmSize, VmRSS
+    if let Ok(s) = std::fs::read_to_string(&status_path) {
+        for key in ["Name:", "State:", "PPid:", "Uid:", "Gid:", "Threads:", "VmSize:", "VmRSS:"].iter() {
+            if let Some(line) = s.lines().find(|l| l.starts_with(key)) {
+                out.push_str(line.trim());
+                out.push('\n');
+            }
+        }
+    } else {
+        out.push_str("(status not available)\n");
+    }
+
+    // Priority/Nice
+    if let Ok(s) = std::fs::read_to_string(&stat_path) {
+        if let Some(rparen) = s.rfind(')') {
+            let after = &s[rparen+2..];
+            let toks: Vec<&str> = after.split_whitespace().collect();
+            let pri = toks.get(15).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+            let ni = toks.get(16).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+            out.push_str(&format!("Priority: {}\nNice: {}\n", pri, ni));
+        }
+    }
+
+    // Exe and CWD
+    if let Ok(p) = std::fs::read_link(&exe_path) { out.push_str(&format!("Exe: {}\n", p.to_string_lossy())); }
+    if let Ok(p) = std::fs::read_link(&cwd_path) { out.push_str(&format!("Cwd: {}\n", p.to_string_lossy())); }
+
+    // Cmdline
+    if let Ok(raw) = std::fs::read(&cmdline_path) {
+        if !raw.is_empty() {
+            let parts: Vec<String> = raw.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+            if !parts.is_empty() {
+                out.push_str("Cmdline: ");
+                out.push_str(&parts.join(" "));
+                out.push('\n');
+            }
+        }
+    }
+
+    // Open file descriptors count
+    let fd_dir = format!("/proc/{}/fd", pid);
+    if let Ok(rd) = std::fs::read_dir(&fd_dir) {
+        let count = rd.filter(|e| e.is_ok()).count();
+        out.push_str(&format!("FDs: {}\n", count));
+    }
+
+    if out.is_empty() { out = String::from("(no details)"); }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_process_details(pid: i32) -> String { format!("Process details are supported on Linux only. PID {}", pid) }
+
+// -------- Logs helpers --------
+#[derive(Clone)]
+struct LogEntry { name: String, path: String, size: u64, modified: String }
+
+fn list_var_log_files() -> Vec<LogEntry> {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    let root = Path::new("/var/log");
+    let mut out: Vec<LogEntry> = Vec::new();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    // Seed with immediate children of /var/log
+    if let Ok(rd) = fs::read_dir(root) {
+        for ent in rd.flatten() {
+            stack.push(ent.path());
+        }
+    } else {
+        return out;
+    }
+
+    while let Some(p) = stack.pop() {
+        // Use symlink_metadata to decide what to do without following dir symlinks
+        let md = match fs::symlink_metadata(&p) { Ok(m) => m, Err(_) => continue };
+        if md.is_file() {
+            // Build display name as relative path under /var/log when possible
+            let name = match p.strip_prefix(root) {
+                Ok(rel) => rel.to_string_lossy().to_string(),
+                Err(_) => p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string_lossy().to_string()),
+            };
+            let size = md.len();
+            let mstr = md.modified().ok().map(fmt_system_time).unwrap_or_else(|| String::from("-"));
+            out.push(LogEntry { name, path: p.to_string_lossy().to_string(), size, modified: mstr });
+        } else if md.is_dir() {
+            // Do not follow directory symlinks to avoid cycles
+            if md.file_type().is_symlink() { continue; }
+            if let Ok(rd) = fs::read_dir(&p) {
+                for ent in rd.flatten() {
+                    stack.push(ent.path());
+                }
+            }
+        } else if md.file_type().is_symlink() {
+            // If it's a symlink, try following only if it points to a file
+            if let Ok(target_md) = fs::metadata(&p) {
+                if target_md.is_file() {
+                    let name = match p.strip_prefix(root) {
+                        Ok(rel) => rel.to_string_lossy().to_string(),
+                        Err(_) => p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string_lossy().to_string()),
+                    };
+                    let size = target_md.len();
+                    let mstr = target_md.modified().ok().map(fmt_system_time).unwrap_or_else(|| String::from("-"));
+                    out.push(LogEntry { name, path: p.to_string_lossy().to_string(), size, modified: mstr });
+                }
+            }
+        }
+    }
+
+    // Sort by name (relative path) for stable listing
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn fmt_system_time(st: std::time::SystemTime) -> String {
+    use std::time::UNIX_EPOCH;
+    match st.duration_since(UNIX_EPOCH) {
+        Ok(dur) => {
+            let secs = dur.as_secs();
+            // Simple YYYY-MM-DD HH:MM formatting using chrono-like manual approach
+            // To avoid extra deps, just show seconds since epoch
+            format!("{}s", secs)
+        }
+        Err(_) => String::from("-"),
+    }
+}
+
+fn read_log_file_best_effort(path: &str, sudo_pass: Option<&str>) -> Result<String, String> {
+    // First try normal read
+    match std::fs::read_to_string(path) {
+        Ok(mut s) => {
+            cap_log_text(&mut s);
+            return Ok(s);
+        }
+        Err(e) => {
+            // If permission denied and sudo password provided, try sudo -S cat
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                if let Some(pw) = sudo_pass {
+                    let mut child = match Command::new("sudo")
+                        .arg("-S")
+                        .arg("--")
+                        .arg("cat")
+                        .arg(path)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn() {
+                        Ok(c) => c,
+                        Err(spawn_err) => return Err(format!("Failed to spawn sudo: {}", spawn_err)),
+                    };
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(pw.as_bytes());
+                        let _ = stdin.write_all(b"\n");
+                    }
+                    let out = child.wait_with_output().map_err(|e| format!("sudo error: {}", e))?;
+                    if out.status.success() {
+                        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                        cap_log_text(&mut text);
+                        return Ok(text);
+                    } else {
+                        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+                        return Err(if err.trim().is_empty() { String::from("sudo failed") } else { err });
+                    }
+                }
+            }
+            // Other errors or no password
+            return Err(format!("{}", e));
+        }
+    }
+}
+
+fn cap_log_text(s: &mut String) {
+    // Keep at most last ~5000 lines to avoid huge popups
+    let max_lines = 5000usize;
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() > max_lines {
+        let tail = &lines[lines.len()-max_lines..];
+        *s = tail.join("\n");
+    }
+}
+
+// -------- Applications detection helpers --------
+fn is_cmd_in_path(bin: &str) -> bool {
+    if let Ok(path) = std::env::var("PATH") {
+        for p in path.split(':') {
+            let mut cand = std::path::PathBuf::from(p);
+            cand.push(bin);
+            if cand.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(md) = std::fs::metadata(&cand) {
+                        let mode = md.permissions().mode();
+                        if mode & 0o111 != 0 { return true; }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // On non-unix, assume presence means usable
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn any_cmd_in_path(cands: &[&str]) -> bool {
+    cands.iter().any(|c| is_cmd_in_path(c))
+}
+
+#[cfg(target_os = "linux")]
+fn is_any_unit_active(units: &[&str]) -> Option<bool> {
+    for u in units {
+        let unit = if u.ends_with(".service") { (*u).to_string() } else { format!("{}.service", u) };
+        if let Ok(out) = Command::new("systemctl").args(["is-active", &unit]).output() {
+            if out.status.success() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    if s.trim() == "active" { return Some(true); }
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_any_unit_active(_units: &[&str]) -> Option<bool> { None }
+
+fn build_applications_status() -> Vec<(String, String, String)> {
+    // Returns (Application, Active, Installed)
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+
+    // Helper to map Option<bool> to string
+    let yn = |b: Option<bool>| -> String {
+        match b {
+            Some(true) => "Yes".to_string(),
+            Some(false) => "No".to_string(),
+            None => "N/A".to_string(),
+        }
+    };
+
+    // Apache2
+    let apache_inst = any_cmd_in_path(&["apache2", "httpd"]);
+    let apache_active = is_any_unit_active(&["apache2", "httpd"]);
+    rows.push(("Apache2".to_string(), yn(apache_active), if apache_inst { "Yes" } else { "No" }.to_string()));
+
+    // Nginx
+    let nginx_inst = any_cmd_in_path(&["nginx"]);
+    let nginx_active = is_any_unit_active(&["nginx"]);
+    rows.push(("Nginx".to_string(), yn(nginx_active), if nginx_inst { "Yes" } else { "No" }.to_string()));
+
+    // Postgresql
+    let pg_inst = any_cmd_in_path(&["postgres", "psql"]);
+    let pg_active = is_any_unit_active(&["postgresql", "postgresql@"]);
+    rows.push(("Postgresql".to_string(), yn(pg_active), if pg_inst { "Yes" } else { "No" }.to_string()));
+
+    // Mysql (include MariaDB)
+    let my_inst = any_cmd_in_path(&["mysqld", "mariadbd", "mysql"]);
+    let my_active = is_any_unit_active(&["mysql", "mariadb"]);
+    rows.push(("Mysql".to_string(), yn(my_active), if my_inst { "Yes" } else { "No" }.to_string()));
+
+    // Podman
+    let pod_inst = any_cmd_in_path(&["podman"]);
+    let pod_active = is_any_unit_active(&["podman"]);
+    rows.push(("Podman".to_string(), yn(pod_active), if pod_inst { "Yes" } else { "No" }.to_string()));
+
+    // Docker
+    let dock_inst = any_cmd_in_path(&["docker"]);
+    let dock_active = is_any_unit_active(&["docker"]);
+    rows.push(("Docker".to_string(), yn(dock_active), if dock_inst { "Yes" } else { "No" }.to_string()));
+
+    rows
+}
+
 // Hardware manufacturer and model detection (best-effort)
 #[cfg(target_os = "linux")]
 fn get_hw_manufacturer_and_model() -> (Option<String>, Option<String>) {
@@ -983,6 +1638,11 @@ fn draw_header(
     // Use cached GPUs for Graphics tab content sizing
     let gpus = &app.gpus;
     let gfx_height: u16 = (gpus.len() as u16 + 1 + 2).max(3); // header + rows + block borders
+    // Applications frame target height (header + rows + borders). Ensure it can fit all apps.
+    let apps_rows: u16 = build_applications_status().len() as u16; // typically 6 rows
+    let apps_block_height: u16 = (apps_rows + 1 + 2).max(3);
+    // Height for the combined Applications | GPU row should fit the larger of the two
+    let gfx_app_height: u16 = gfx_height.max(apps_block_height);
     let sys_block_height: u16 = 6 + 2; // 6 info lines (Manufacturer with Hardware Model inline, Processor Model, OS Name, Kernel, OS version, Hostname) + block borders
     let cpu_block_height: u16 = 6 + 2; // 6 info lines + block borders (Cores, Threads, CPU%, Load, Uptime, Temp)
     let mem_block_height: u16 = 6 + 2; // 4 info lines + 2 gauge rows (RAM, SWAP) + block borders
@@ -997,12 +1657,14 @@ fn draw_header(
     let top_content_height = match app.selected_top_tab {
         0 => top_frames_height + gfx_height + disks_block_height + proc_block_height,
         1 => cpu_height,
-        2 => cpu_height.max(5),
+        2 => cpu_height.max(5), // Services tab height (min)
+        3 => cpu_height.max(5), // Shell tab height (min)
+        4 => cpu_height.max(5), // Logs tab height (min)
         _ => cpu_height,
     };
 
-    // Layout: remove visual top Tabs bar and use full area for content; for top/htop and Shell, allow content to fill remaining space
-    let constraints = if app.selected_top_tab == 1 || app.selected_top_tab == 2 || app.selected_top_tab == 0 {
+    // Layout: remove visual top Tabs bar and use full area for content; for Dashboard, top/htop, Services, Logs, and Shell, allow content to fill remaining space
+    let constraints = if app.selected_top_tab == 0 || app.selected_top_tab == 1 || app.selected_top_tab == 2 || app.selected_top_tab == 3 || app.selected_top_tab == 4 {
         [
             Constraint::Min(5),    // content fills remaining space
         ]
@@ -1221,25 +1883,22 @@ fn draw_header(
             }
         }
 
-        // Render a compact Process list at the bottom of the top/htop tab
+        // Render Processes as a scrollable selectable Table at the bottom of the top/htop tab
         {
             use std::collections::HashMap;
             use std::fs;
 
             let proc_area = cpu_chunks[5];
-            // Determine how many lines fit; leave space for header
-            let available_rows = proc_area.height.saturating_sub(1) as usize;
-            let mut lines: Vec<Line> = Vec::new();
+            // Rows per page (minus header)
+            let rows_per_page = proc_area.height.saturating_sub(1) as usize;
 
-            // Header
-            lines.push(Line::from(Span::styled(
-                format!("{:>6}  {:<8} {:>3} {:>3} {:>6} {:>7} {:>10}  {}", "PID", "USER", "PRI", "NI", "CPU%", "MEM%", "TIME", "CMD"),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )));
-
-            // Compute width for CMD column based on available content width
-            let fixed_width = 6 + 2 + 8 + 1 + 3 + 1 + 3 + 1 + 6 + 1 + 7 + 1 + 10 + 2; // approx fixed columns + spaces
-            let base_cmd_width = proc_area.width.saturating_sub(fixed_width as u16) as usize;
+            // Clamp selection and compute window start based on selection
+            let total = app.procs_pids_sorted.len();
+            let selected = app.procs_selected.min(total.saturating_sub(1));
+            let max_start = total.saturating_sub(rows_per_page);
+            let mut start = app.procs_scroll.min(max_start);
+            if selected < start { start = selected; }
+            if rows_per_page > 0 && selected >= start + rows_per_page { start = selected + 1 - rows_per_page; }
 
             // Build a uid->username map from /etc/passwd (simple parser)
             let mut uid_name: HashMap<u32, String> = HashMap::new();
@@ -1255,39 +1914,46 @@ fn draw_header(
                 }
             }
 
+            // Header
+            let header = Row::new(vec![
+                Cell::from(Span::styled("PID", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("USER", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("PRI", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("NI", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("CPU%", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("MEM%", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("TIME", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("CMD", Style::default().add_modifier(Modifier::BOLD))),
+            ]);
+
+            // Build rows from cached PID ordering
+            let mut rows: Vec<Row> = Vec::new();
             let total_mem_kib_f = total_mem as f32;
-            let mut rows: Vec<(i32, f32, f32, u64, String, String)> = sys
-                .processes()
-                .iter()
-                .map(|(pid, p)| {
-                    let pid_i = pid.as_u32() as i32;
-                    let cpu = p.cpu_usage();
+            for (i, pid) in app.procs_pids_sorted.iter().cloned().skip(start).take(rows_per_page).enumerate() {
+                // Find process by pid from sys
+                let mut cpu = 0.0f32;
+                let mut mem_pct = 0.0f32;
+                let mut time_str = String::new();
+                let mut cmd = String::new();
+                if let Some((_, p)) = sys.processes().iter().find(|(p, _)| p.as_u32() as i32 == pid) {
+                    cpu = p.cpu_usage();
                     let mem_kib = p.memory();
-                    let mem_pct = if total_mem_kib_f > 0.0 { (mem_kib as f32 / total_mem_kib_f) * 100.0 } else { 0.0 };
+                    mem_pct = if total_mem_kib_f > 0.0 { (mem_kib as f32 / total_mem_kib_f) * 100.0 } else { 0.0 };
                     let secs = p.run_time();
                     let days = secs / 86_400;
                     let hours = (secs % 86_400) / 3_600;
                     let minutes = (secs % 3_600) / 60;
                     let seconds = secs % 60;
-                    let time_str = if days > 0 { format!("{}d {:02}:{:02}:{:02}", days, hours, minutes, seconds) } else { format!("{:02}:{:02}:{:02}", hours, minutes, seconds) };
-                    let cmd = if !p.cmd().is_empty() { p.cmd().join(std::ffi::OsStr::new(" ")).to_string_lossy().into_owned() } else { p.name().to_string_lossy().into_owned() };
-                    (pid_i, cpu, mem_pct, mem_kib, time_str, cmd)
-                })
-                .collect();
-
-            // Sort by CPU descending
-            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            for (i, (pid, cpu, mem_pct, _mem_kib, time_str, cmd)) in rows.into_iter().enumerate() {
-                if i + 1 >= available_rows { break; }
-
-                // Resolve USER, PRI, NI via /proc files
+                    time_str = if days > 0 { format!("{}d {:02}:{:02}:{:02}", days, hours, minutes, seconds) } else { format!("{:02}:{:02}:{:02}", hours, minutes, seconds) };
+                    cmd = if !p.cmd().is_empty() { p.cmd().join(std::ffi::OsStr::new(" ")).to_string_lossy().into_owned() } else { p.name().to_string_lossy().into_owned() };
+                }
+                // USER via /proc
                 let user = {
                     let status_path = format!("/proc/{}/status", pid);
                     if let Ok(s) = fs::read_to_string(&status_path) {
                         if let Some(uid_line) = s.lines().find(|l| l.starts_with("Uid:")) {
                             let mut it = uid_line.split_whitespace();
-                            it.next(); // skip "Uid:"
+                            it.next();
                             if let Some(uid_str) = it.next() {
                                 if let Ok(uid) = uid_str.parse::<u32>() {
                                     uid_name.get(&uid).cloned().unwrap_or_else(|| uid.to_string())
@@ -1296,12 +1962,12 @@ fn draw_header(
                         } else { String::from("?") }
                     } else { String::from("?") }
                 };
-
+                // PRI/NI via /proc
                 let (pri, ni) = {
                     let stat_path = format!("/proc/{}/stat", pid);
                     if let Ok(s) = fs::read_to_string(&stat_path) {
                         if let Some(rparen) = s.rfind(')') {
-                            let after = &s[rparen+2..]; // skip ") "
+                            let after = &s[rparen+2..];
                             let toks: Vec<&str> = after.split_whitespace().collect();
                             let pri = toks.get(15).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
                             let ni = toks.get(16).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
@@ -1309,17 +1975,53 @@ fn draw_header(
                         } else { (0, 0) }
                     } else { (0, 0) }
                 };
-
-                let cmd_display = if cmd.len() > base_cmd_width && base_cmd_width > 1 { format!("{}…", &cmd[..base_cmd_width.saturating_sub(1)]) } else { cmd };
-                let line = Line::from(Span::raw(format!(
-                    "{:>6}  {:<8} {:>3} {:>3} {:>6.1} {:>7.1} {:>10}  {}",
-                    pid, user, pri, ni, cpu, mem_pct, time_str, cmd_display
-                )));
-                lines.push(line);
+                // Build row
+                let mut row = Row::new(vec![
+                    Cell::from(Span::raw(format!("{:>6}", pid))),
+                    Cell::from(Span::raw(format!("{:<8}", user))),
+                    Cell::from(Span::raw(format!("{:>3}", pri))),
+                    Cell::from(Span::raw(format!("{:>3}", ni))),
+                    Cell::from(Span::raw(format!("{:>6.1}", cpu))),
+                    Cell::from(Span::raw(format!("{:>7.1}", mem_pct))),
+                    Cell::from(Span::raw(format!("{:>10}", time_str))),
+                    Cell::from(Span::raw(cmd)),
+                ]);
+                if start + i == selected {
+                    row = row.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                rows.push(row);
+            }
+            if rows.is_empty() {
+                rows.push(Row::new(vec![
+                    Cell::from(Span::raw("No processes.")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                ]));
             }
 
-            let proc_paragraph = ratatui::widgets::Paragraph::new(lines);
-            f.render_widget(proc_paragraph, proc_area);
+            // Column widths: PID 6, USER 8, PRI 3, NI 3, CPU% 6, MEM% 7, TIME 10, CMD fills rest
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(6),
+                    Constraint::Length(8),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(6),
+                    Constraint::Length(7),
+                    Constraint::Length(10),
+                    Constraint::Min(10),
+                ],
+            )
+            .header(header)
+            .block(Block::default());
+
+            f.render_widget(table, proc_area);
         }
     } else if app.selected_top_tab == 0 {
         // System tab content: top frames row (System | CPU), then GPU frame
@@ -1327,7 +2029,7 @@ fn draw_header(
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(top_frames_height), // top frames area (System | CPU | Memory)
-                Constraint::Length(gfx_height),        // GPU block
+                Constraint::Length(gfx_app_height),   // Applications | GPU row (height fits larger of the two)
                 Constraint::Length(disks_block_height),// Disks block
                 Constraint::Min(5),                    // Process block fills remaining space
             ])
@@ -1566,66 +2268,126 @@ fn draw_header(
             f.render_widget(gauge_swap, row_swap[1]);
         }
 
-        // GPU area
-        let gfx_inner = sys_gfx_chunks[1];
+        // Applications and GPU row (two columns)
+        let gpu_app_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Ratio(2, 5), // left: Applications (narrower)
+                Constraint::Ratio(3, 5), // right: GPU (wider)
+            ])
+            .split(sys_gfx_chunks[1]);
 
-        // Build lines: header + each GPU with aligned columns
-        let mut lines: Vec<Line> = Vec::new();
-        // Column widths
-        let pci_w: usize = 12;     // e.g., 0000:01:00.0 (12 chars)
-        let driver_w: usize = 12;  // e.g., amdgpu, nvidia, i915
-        let vendor_w: usize = 10;  // e.g., NVIDIA, AMD, Intel
-        let temp_w: usize = 8;     // e.g., 65.2°C or N/A
+        // Right: GPU frame
+        {
+            // Build lines: header + each GPU with aligned columns
+            let mut lines: Vec<Line> = Vec::new();
+            // Column widths
+            let pci_w: usize = 12;     // e.g., 0000:01:00.0 (12 chars)
+            let driver_w: usize = 12;  // e.g., amdgpu, nvidia, i915
+            let vendor_w: usize = 10;  // e.g., NVIDIA, AMD, Intel
+            let temp_w: usize = 8;     // e.g., 65.2°C or N/A
 
-        // Simple truncation helper with ellipsis when needed
-        let trunc = |s: &str, max: usize| -> String {
-            if max == 0 { return String::new(); }
-            let len = s.chars().count();
-            if len <= max { return s.to_string(); }
-            let keep = max.saturating_sub(1);
-            let mut out = String::with_capacity(max);
-            for (i, ch) in s.chars().enumerate() {
-                if i >= keep { break; }
-                out.push(ch);
-            }
-            out.push('…');
-            out
-        };
+            // Simple truncation helper with ellipsis when needed
+            let trunc = |s: &str, max: usize| -> String {
+                if max == 0 { return String::new(); }
+                let len = s.chars().count();
+                if len <= max { return s.to_string(); }
+                let keep = max.saturating_sub(1);
+                let mut out = String::with_capacity(max);
+                for (i, ch) in s.chars().enumerate() {
+                    if i >= keep { break; }
+                    out.push(ch);
+                }
+                out.push('…');
+                out
+            };
 
-        // Header
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{:<pci_w$}  {:<driver_w$}  {:<vendor_w$}  {:<temp_w$}  {}",
-                "PCI", "DRIVER", "VENDOR", "TEMP", "MODEL",
-                pci_w=pci_w, driver_w=driver_w, vendor_w=vendor_w, temp_w=temp_w
-            ),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )));
-
-        if gpus.is_empty() {
-            lines.push(Line::from(Span::raw("No GPUs detected")));
-        } else {
-            // Rows
-            for g in gpus {
-                let pci = trunc(&g.pci_addr, pci_w);
-                let drv = trunc(&g.driver, driver_w);
-                let ven = trunc(&g.vendor, vendor_w);
-                let temp = match g.temp_c {
-                    Some(t) => format!("{:.1}°C", t),
-                    None => "N/A".to_string(),
-                };
-                let temp = trunc(&temp, temp_w);
-                let line = Line::from(Span::raw(format!(
+            // Header
+            lines.push(Line::from(Span::styled(
+                format!(
                     "{:<pci_w$}  {:<driver_w$}  {:<vendor_w$}  {:<temp_w$}  {}",
-                    pci, drv, ven, temp, g.model,
+                    "PCI", "DRIVER", "VENDOR", "TEMP", "MODEL",
                     pci_w=pci_w, driver_w=driver_w, vendor_w=vendor_w, temp_w=temp_w
-                )));
-                lines.push(line);
+                ),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+
+            if gpus.is_empty() {
+                lines.push(Line::from(Span::raw("No GPUs detected")));
+            } else {
+                // Rows
+                for g in gpus {
+                    let pci = trunc(&g.pci_addr, pci_w);
+                    let drv = trunc(&g.driver, driver_w);
+                    let ven = trunc(&g.vendor, vendor_w);
+                    let temp = match g.temp_c {
+                        Some(t) => format!("{:.1}°C", t),
+                        None => "N/A".to_string(),
+                    };
+                    let temp = trunc(&temp, temp_w);
+                    let line = Line::from(Span::raw(format!(
+                        "{:<pci_w$}  {:<driver_w$}  {:<vendor_w$}  {:<temp_w$}  {}",
+                        pci, drv, ven, temp, g.model,
+                        pci_w=pci_w, driver_w=driver_w, vendor_w=vendor_w, temp_w=temp_w
+                    )));
+                    lines.push(line);
+                }
+            }
+            let gfx_par = ratatui::widgets::Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" GPU "));
+            f.render_widget(gfx_par, gpu_app_cols[1]);
+        }
+
+        // Left: Applications frame (moved here from bottom row)
+        {
+            let app_outer = gpu_app_cols[0];
+            let app_block = Block::default().borders(Borders::ALL).title(" Applications ");
+            f.render_widget(app_block, app_outer);
+            let app_inner = Rect {
+                x: app_outer.x + 1,
+                y: app_outer.y + 1,
+                width: app_outer.width.saturating_sub(2),
+                height: app_outer.height.saturating_sub(2),
+            };
+            if app_inner.width > 0 && app_inner.height > 0 {
+                // Build rows for Applications table
+                let rows_data = build_applications_status();
+                let header = Row::new(vec![
+                    Cell::from(Span::styled("Application", Style::default().add_modifier(Modifier::BOLD))),
+                    Cell::from(Span::styled("Active", Style::default().add_modifier(Modifier::BOLD))),
+                    Cell::from(Span::styled("Installed", Style::default().add_modifier(Modifier::BOLD))),
+                ]);
+                let mut rows: Vec<Row> = Vec::new();
+                for (name, active, installed) in rows_data {
+                    let active_style = if active == "Yes" { Style::default().fg(Color::Green) } else if active == "No" { Style::default().fg(Color::Red) } else { Style::default() };
+                    let inst_style = if installed == "Yes" { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) };
+                    rows.push(Row::new(vec![
+                        Cell::from(Span::raw(name)),
+                        Cell::from(Span::styled(active, active_style)),
+                        Cell::from(Span::styled(installed, inst_style)),
+                    ]));
+                }
+                if rows.is_empty() {
+                    rows.push(Row::new(vec![
+                        Cell::from(Span::raw("No applications.")),
+                        Cell::from(Span::raw("")),
+                        Cell::from(Span::raw("")),
+                    ]));
+                }
+                // Column widths: name flex, Active 8, Installed 10
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Min(10),
+                        Constraint::Length(8),
+                        Constraint::Length(10),
+                    ],
+                )
+                .header(header)
+                .block(Block::default());
+                f.render_widget(table, app_inner);
             }
         }
-        let gfx_par = ratatui::widgets::Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" GPU "));
-        f.render_widget(gfx_par, gfx_inner);
 
         // Disks and Network area (two columns)
         let disks_row_cols = Layout::default()
@@ -1747,116 +2509,73 @@ fn draw_header(
             f.render_widget(net_par, net_inner);
         }
 
-        // Process area (framed)
-        let proc_outer = sys_gfx_chunks[3];
-        let proc_block = Block::default().borders(Borders::ALL).title(" Process ");
-        f.render_widget(proc_block, proc_outer);
-        let proc_inner = Rect {
-            x: proc_outer.x + 1,
-            y: proc_outer.y + 1,
-            width: proc_outer.width.saturating_sub(2),
-            height: proc_outer.height.saturating_sub(2),
-        };
-        if proc_inner.width > 0 && proc_inner.height > 0 {
-            use std::collections::HashMap;
-            use std::fs;
-
-            let mut lines: Vec<Line> = Vec::new();
-            // Header
-            lines.push(Line::from(Span::styled(
-                format!("{:>6}  {:<8} {:>3} {:>3} {:>6} {:>7} {:>10}  {}", "PID", "USER", "PRI", "NI", "CPU%", "MEM%", "TIME", "CMD"),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )));
-
-            // Width for CMD column
-            let fixed_width = 6 + 2 + 8 + 1 + 3 + 1 + 3 + 1 + 6 + 1 + 7 + 1 + 10 + 2;
-            let base_cmd_width = proc_inner.width.saturating_sub(fixed_width as u16) as usize;
-
-            // uid -> username map
-            let mut uid_name: HashMap<u32, String> = HashMap::new();
-            if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
-                for line in passwd.lines() {
-                    if line.trim().is_empty() || line.starts_with('#') { continue; }
-                    let parts: Vec<&str> = line.split(':').collect();
-                    if parts.len() > 3 {
-                        if let Ok(uid) = parts[2].parse::<u32>() {
-                            uid_name.insert(uid, parts[0].to_string());
-                        }
-                    }
-                }
-            }
-
-            let total_mem_kib_f = total_mem as f32;
-            let mut rows: Vec<(i32, f32, f32, u64, String, String)> = sys
-                .processes()
-                .iter()
-                .map(|(pid, p)| {
-                    let pid_i = pid.as_u32() as i32;
-                    let cpu = p.cpu_usage();
-                    let mem_kib = p.memory();
-                    let mem_pct = if total_mem_kib_f > 0.0 { (mem_kib as f32 / total_mem_kib_f) * 100.0 } else { 0.0 };
-                    let secs = p.run_time();
-                    let days = secs / 86_400;
-                    let hours = (secs % 86_400) / 3_600;
-                    let minutes = (secs % 3_600) / 60;
-                    let seconds = secs % 60;
-                    let time_str = if days > 0 { format!("{}d {:02}:{:02}:{:02}", days, hours, minutes, seconds) } else { format!("{:02}:{:02}:{:02}", hours, minutes, seconds) };
-                    let cmd = if !p.cmd().is_empty() { p.cmd().join(std::ffi::OsStr::new(" ")).to_string_lossy().into_owned() } else { p.name().to_string_lossy().into_owned() };
-                    (pid_i, cpu, mem_pct, mem_kib, time_str, cmd)
-                })
-                .collect();
-
-            // Sort by CPU desc
-            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            // Rows to fit inner height (minus header)
-            let available_rows = proc_inner.height.saturating_sub(1) as usize;
-            for (i, (pid, cpu, mem_pct, _mem_kib, time_str, cmd)) in rows.into_iter().enumerate() {
-                if i + 1 >= available_rows { break; }
-
-                // USER from /proc/[pid]/status
-                let user = {
-                    let status_path = format!("/proc/{}/status", pid);
-                    if let Ok(s) = fs::read_to_string(&status_path) {
-                        if let Some(uid_line) = s.lines().find(|l| l.starts_with("Uid:")) {
-                            let mut it = uid_line.split_whitespace();
-                            it.next();
-                            if let Some(uid_str) = it.next() {
-                                if let Ok(uid) = uid_str.parse::<u32>() {
-                                    uid_name.get(&uid).cloned().unwrap_or_else(|| uid.to_string())
-                                } else { String::from("?") }
-                            } else { String::from("?") }
-                        } else { String::from("?") }
-                    } else { String::from("?") }
-                };
-
-                // PRI/NI from /proc/[pid]/stat
-                let (pri, ni) = {
-                    let stat_path = format!("/proc/{}/stat", pid);
-                    if let Ok(s) = fs::read_to_string(&stat_path) {
-                        if let Some(rparen) = s.rfind(')') {
-                            let after = &s[rparen+2..];
-                            let toks: Vec<&str> = after.split_whitespace().collect();
-                            let pri = toks.get(15).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
-                            let ni = toks.get(16).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
-                            (pri, ni)
-                        } else { (0, 0) }
-                    } else { (0, 0) }
-                };
-
-                let cmd_display = if cmd.len() > base_cmd_width && base_cmd_width > 1 { format!("{}…", &cmd[..base_cmd_width.saturating_sub(1)]) } else { cmd };
-                let line = Line::from(Span::raw(format!(
-                    "{:>6}  {:<8} {:>3} {:>3} {:>6.1} {:>7.1} {:>10}  {}",
-                    pid, user, pri, ni, cpu, mem_pct, time_str, cmd_display
-                )));
-                lines.push(line);
-            }
-
-            let proc_par = ratatui::widgets::Paragraph::new(lines);
-            f.render_widget(proc_par, proc_inner);
-        }
 
     } else if app.selected_top_tab == 2 {
+        // Services tab
+        let block = Block::default().borders(Borders::ALL).title(" Services (SystemD) ");
+        f.render_widget(block, top_area);
+        let inner = Rect { x: top_area.x + 1, y: top_area.y + 1, width: top_area.width.saturating_sub(2), height: top_area.height.saturating_sub(2) };
+        if inner.width > 0 && inner.height > 0 {
+            #[cfg(target_os = "linux")]
+            {
+                let services = get_all_services();
+                // Clamp selection within available items (compute effective selection)
+                let total = services.len();
+                let selected = app.services_selected.min(total.saturating_sub(1));
+                // Compute visible window based on selection and available height (minus header row)
+                let rows_per_page = inner.height.saturating_sub(1) as usize;
+                let max_start = total.saturating_sub(rows_per_page);
+                let mut start = app.services_scroll.min(max_start);
+                if selected < start { start = selected; }
+                if rows_per_page > 0 && selected >= start + rows_per_page { start = selected + 1 - rows_per_page; }
+                // Build header and rows
+                let header = Row::new(vec![
+                    Cell::from(Span::styled("UNIT", Style::default().add_modifier(Modifier::BOLD))),
+                    Cell::from(Span::styled("ACTIVE", Style::default().add_modifier(Modifier::BOLD))),
+                    Cell::from(Span::styled("DESCRIPTION", Style::default().add_modifier(Modifier::BOLD))),
+                ]);
+                let mut rows: Vec<Row> = Vec::new();
+                for (i, (unit, active, desc)) in services.into_iter().skip(start).take(rows_per_page).enumerate() {
+                    let unit_style = if active == "active" { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) };
+                    let mut row = Row::new(vec![
+                        Cell::from(Span::styled(unit, unit_style)),
+                        Cell::from(Span::raw(active)),
+                        Cell::from(Span::raw(desc)),
+                    ]);
+                    if start + i == selected {
+                        row = row.style(Style::default().add_modifier(Modifier::REVERSED));
+                    }
+                    rows.push(row);
+                }
+                if rows.is_empty() {
+                    rows.push(Row::new(vec![
+                        Cell::from(Span::raw("No services found.")),
+                        Cell::from(Span::raw("")),
+                        Cell::from(Span::raw("")),
+                    ]));
+                }
+                // Calculate column widths: UNIT ~ 40, ACTIVE ~ 10, DESCRIPTION fills rest
+                let unit_w = 40u16.min(inner.width.saturating_sub(12));
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Length(unit_w),
+                        Constraint::Length(10),
+                        Constraint::Min(10),
+                    ],
+                )
+                .header(header)
+                .block(Block::default());
+                f.render_widget(table, inner);
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let msg = vec![Line::from(Span::raw("Services listing is supported on Linux only."))];
+                let paragraph = ratatui::widgets::Paragraph::new(msg);
+                f.render_widget(paragraph, inner);
+            }
+        }
+    } else if app.selected_top_tab == 3 {
         let block = Block::default().borders(Borders::ALL).title(" Shell ");
         f.render_widget(block, top_area);
         let inner = Rect { x: top_area.x + 1, y: top_area.y + 1, width: top_area.width.saturating_sub(2), height: top_area.height.saturating_sub(2) };
@@ -1878,6 +2597,56 @@ fn draw_header(
                 f.render_widget(paragraph, inner);
             }
         }
+    } else if app.selected_top_tab == 4 {
+        // Logs tab
+        let block = Block::default().borders(Borders::ALL).title(" Logs ");
+        f.render_widget(block, top_area);
+        let inner = Rect { x: top_area.x + 1, y: top_area.y + 1, width: top_area.width.saturating_sub(2), height: top_area.height.saturating_sub(2) };
+        if inner.width > 0 && inner.height > 0 {
+            let files = list_var_log_files();
+            let total = files.len();
+            let selected = app.logs_selected.min(total.saturating_sub(1));
+            let rows_per_page = inner.height.saturating_sub(1) as usize;
+            let max_start = total.saturating_sub(rows_per_page);
+            let mut start = app.logs_scroll.min(max_start);
+            if selected < start { start = selected; }
+            if rows_per_page > 0 && selected >= start + rows_per_page { start = selected + 1 - rows_per_page; }
+            // Header
+            let header = Row::new(vec![
+                Cell::from(Span::styled("NAME", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("SIZE", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("MODIFIED", Style::default().add_modifier(Modifier::BOLD))),
+            ]);
+            let mut rows: Vec<Row> = Vec::new();
+            for (i, ent) in files.into_iter().skip(start).take(rows_per_page).enumerate() {
+                let mut row = Row::new(vec![
+                    Cell::from(Span::raw(ent.name)),
+                    Cell::from(Span::raw(fmt_bytes(ent.size))),
+                    Cell::from(Span::raw(ent.modified)),
+                ]);
+                if start + i == selected { row = row.style(Style::default().add_modifier(Modifier::REVERSED)); }
+                rows.push(row);
+            }
+            if rows.is_empty() {
+                rows.push(Row::new(vec![
+                    Cell::from(Span::raw("No log files.")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                ]));
+            }
+            // Column widths: Name fills, Size 12, Modified 16
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Min(10),
+                    Constraint::Length(12),
+                    Constraint::Length(16),
+                ],
+            )
+            .header(header)
+            .block(Block::default());
+            f.render_widget(table, inner);
+        }
     }
 }
 
@@ -1885,7 +2654,7 @@ fn draw_header(
 /// Draw the function key menu bar (F1..F10) along the bottom.
 fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // Menu bar with function keys
-    // F2: Dashboard, F3: top/htop, (F4/F5/F6/F7/F8/F9/F11 unmapped), F10: Exit, F12: Shell tab
+    // F2: Dashboard, F3: top/htop, F4: Services (SystemD), F10: Exit, F12: Shell tab
     // Fill background with a lighter blue for the entire menu area
     let bg = Block::default().style(Style::default().bg(Color::LightBlue));
     f.render_widget(bg, area);
@@ -1901,7 +2670,9 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // Determine which menu item to highlight based on active tab
     let dash_active = app.selected_top_tab == 0;
     let top_active = app.selected_top_tab == 1;
-    let shell_active = app.selected_top_tab == 2;
+    let services_active = app.selected_top_tab == 2;
+    let logs_active = app.selected_top_tab == 4;
+    let shell_active = app.selected_top_tab == 3;
 
     let text = Line::from(vec![
         // F1 Help (not a tab)
@@ -1912,9 +2683,12 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         // F3 top/htop
         Span::styled(" F3 ", if top_active { key_style_active } else { key_style }),
         Span::styled(" top/htop  ", if top_active { hint_style_active } else { hint_style }),
-        // Unmapped
-        Span::styled(" F4 ", key_style), Span::styled("        ", hint_style),
-        Span::styled(" F5 ", key_style), Span::styled("        ", hint_style),
+        // F4 Services (SystemD)
+        Span::styled(" F4 ", if services_active { key_style_active } else { key_style }),
+        Span::styled(" Services (SystemD)  ", if services_active { hint_style_active } else { hint_style }),
+        // F5 Logs
+        Span::styled(" F5 ", if logs_active { key_style_active } else { key_style }),
+        Span::styled(" Logs  ", if logs_active { hint_style_active } else { hint_style }),
         Span::styled(" F6 ", key_style), Span::styled("        ", hint_style),
         Span::styled(" F7 ", key_style), Span::styled("        ", hint_style),
         Span::styled(" F8 ", key_style), Span::styled("        ", hint_style),
@@ -1942,9 +2716,9 @@ fn draw_help_popup(f: &mut ratatui::Frame<'_>, size: Rect) {
         Line::from(Span::raw(format!("License: {}", env!("CARGO_PKG_LICENSE")))),
         Line::from(Span::raw(" ")),
         Line::from(Span::raw("Navigation and hotkeys:")),
-        Line::from(Span::raw("    - Left/Right, h/l, Tab/BackTab, or 1/2/3 to switch top tabs.")),
+        Line::from(Span::raw("    - Left/Right, h/l, Tab/BackTab, or 1/2/3/4/5 to switch top tabs.")),
         Line::from(Span::raw("    - Home Dashboard, End last tab, PgDn previous tab, PgUp next tab.")),
-        Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F12 Shell (embedded PTY).")),
+        Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F4 Services (SystemD), F5 Logs, F12 Shell (embedded PTY).")),
         Line::from(Span::raw("    - In Shell tab: keys go to your shell; Ctrl-C is sent to the shell (F10 exits app).")),
         Line::from(Span::raw("    - F10 exit app; q also exits.")), 
     ];
@@ -2005,3 +2779,163 @@ fn draw_help_popup(f: &mut ratatui::Frame<'_>, size: Rect) {
     f.render_widget(paragraph, inner);
 }
 
+/// Draw the Service Details popup with a dynamic title and multi-line body text.
+fn draw_service_popup(f: &mut ratatui::Frame<'_>, size: Rect, title: &str, text: &str) {
+    // Split text into lines and measure width
+    let lines_raw: Vec<&str> = text.split('\n').collect();
+    let max_text_width: u16 = lines_raw.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0).saturating_add(1);
+    // Add some padding and clamp to screen bounds
+    let mut popup_w: u16 = max_text_width.saturating_add(4);
+    if popup_w > size.width { popup_w = size.width; }
+    // Height is based on number of lines (capped to screen)
+    let mut popup_h: u16 = (lines_raw.len() as u16).saturating_add(2);
+    if popup_h > size.height { popup_h = size.height; }
+
+    // Center the popup
+    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
+    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
+    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
+
+    // Shadow
+    let sx = area.x.saturating_add(1);
+    let sy = area.y.saturating_add(1);
+    if sx < size.x + size.width && sy < size.y + size.height {
+        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
+        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
+        if sw > 0 && sh > 0 {
+            let shadow = Rect { x: sx, y: sy, width: sw, height: sh };
+            let shadow_block = Block::default().style(Style::default().bg(Color::Black));
+            f.render_widget(shadow_block, shadow);
+        }
+    }
+
+    // Border and clear
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Service: {} ", title))
+        .border_style(Style::default().fg(Color::Green));
+    f.render_widget(block, area);
+
+    // Inner text area
+    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
+    let lines: Vec<Line> = lines_raw.into_iter().map(|l| Line::from(Span::raw(format!(" {}", l)))).collect();
+    let paragraph = ratatui::widgets::Paragraph::new(lines);
+    f.render_widget(paragraph, inner);
+}
+
+
+
+/// Draw the Process Details popup with a dynamic title and multi-line body text.
+fn draw_process_popup(f: &mut ratatui::Frame<'_>, size: Rect, title: &str, text: &str) {
+    // Split text into lines and measure width
+    let lines_raw: Vec<&str> = text.split('\n').collect();
+    let max_text_width: u16 = lines_raw.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0).saturating_add(1);
+    // Add some padding and clamp to screen bounds
+    let mut popup_w: u16 = max_text_width.saturating_add(4);
+    if popup_w > size.width { popup_w = size.width; }
+    // Height is based on number of lines (capped to screen)
+    let mut popup_h: u16 = (lines_raw.len() as u16).saturating_add(2);
+    if popup_h > size.height { popup_h = size.height; }
+
+    // Center the popup
+    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
+    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
+    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
+
+    // Shadow
+    let sx = area.x.saturating_add(1);
+    let sy = area.y.saturating_add(1);
+    if sx < size.x + size.width && sy < size.y + size.height {
+        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
+        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
+        if sw > 0 && sh > 0 {
+            let shadow = Rect { x: sx, y: sy, width: sw, height: sh };
+            let shadow_block = Block::default().style(Style::default().bg(Color::Black));
+            f.render_widget(shadow_block, shadow);
+        }
+    }
+
+    // Border and clear
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Process: {} ", title))
+        .border_style(Style::default().fg(Color::Yellow));
+    f.render_widget(block, area);
+
+    // Inner text area
+    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
+    let lines: Vec<Line> = lines_raw.into_iter().map(|l| Line::from(Span::raw(format!(" {}", l)))).collect();
+    let paragraph = ratatui::widgets::Paragraph::new(lines);
+    f.render_widget(paragraph, inner);
+}
+
+/// Draw the Log Details popup with a dynamic title and multi-line body text.
+fn draw_log_popup(f: &mut ratatui::Frame<'_>, size: Rect, title: &str, text: &str) {
+    // Split text into lines and measure width
+    let lines_raw: Vec<&str> = text.split('\n').collect();
+    let max_text_width: u16 = lines_raw.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0).saturating_add(1);
+    let mut popup_w: u16 = max_text_width.saturating_add(4);
+    if popup_w > size.width { popup_w = size.width; }
+    let mut popup_h: u16 = (lines_raw.len() as u16).saturating_add(2);
+    if popup_h > size.height { popup_h = size.height; }
+    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
+    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
+    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
+    let sx = area.x.saturating_add(1);
+    let sy = area.y.saturating_add(1);
+    if sx < size.x + size.width && sy < size.y + size.height {
+        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
+        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
+        if sw > 0 && sh > 0 { let shadow = Rect { x: sx, y: sy, width: sw, height: sh }; let shadow_block = Block::default().style(Style::default().bg(Color::Black)); f.render_widget(shadow_block, shadow); }
+    }
+    f.render_widget(Clear, area);
+    let block = Block::default().borders(Borders::ALL).title(format!(" Log: {} ", title)).border_style(Style::default().fg(Color::LightBlue));
+    f.render_widget(block, area);
+    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
+    let lines: Vec<Line> = lines_raw.into_iter().map(|l| Line::from(Span::raw(format!(" {}", l)))).collect();
+    let paragraph = ratatui::widgets::Paragraph::new(lines);
+    f.render_widget(paragraph, inner);
+}
+
+/// Draw a sudo password prompt popup for Logs, with masked input and error line.
+fn draw_logs_password_prompt(f: &mut ratatui::Frame<'_>, size: Rect, error_text: &str, chars_len: usize) {
+    let lines = vec![
+        Line::from(Span::raw("Enter sudo password to read protected logs:")),
+        Line::from(Span::raw(" ")), // spacer
+        Line::from(Span::raw("Password: ")), // input line label
+        Line::from(Span::raw(" ")), // spacer
+        Line::from(Span::styled(error_text.to_string(), Style::default().fg(Color::Red))),
+    ];
+    // Fixed width popup
+    let mut popup_w: u16 = 60;
+    if popup_w > size.width { popup_w = size.width; }
+    let mut popup_h: u16 = 7;
+    if popup_h > size.height { popup_h = size.height; }
+    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
+    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
+    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
+    let sx = area.x.saturating_add(1);
+    let sy = area.y.saturating_add(1);
+    if sx < size.x + size.width && sy < size.y + size.height {
+        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
+        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
+        if sw > 0 && sh > 0 { let shadow = Rect { x: sx, y: sy, width: sw, height: sh }; let shadow_block = Block::default().style(Style::default().bg(Color::Black)); f.render_widget(shadow_block, shadow); }
+    }
+    f.render_widget(Clear, area);
+    let block = Block::default().borders(Borders::ALL).title(" Sudo Password ").border_style(Style::default().fg(Color::Magenta));
+    f.render_widget(block, area);
+    // Inner
+    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
+    let mut display_lines: Vec<Line> = Vec::new();
+    display_lines.push(lines[0].clone());
+    display_lines.push(lines[1].clone());
+    // Render password masked line
+    let masked = "*".repeat(chars_len);
+    display_lines.push(Line::from(Span::raw(format!("Password: {}", masked))));
+    display_lines.push(lines[3].clone());
+    display_lines.push(lines[4].clone());
+    let paragraph = ratatui::widgets::Paragraph::new(display_lines);
+    f.render_widget(paragraph, inner);
+}

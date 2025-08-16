@@ -8,7 +8,7 @@ description = "A lightweight terminal system monitor (TUI) for Linux"
 readme = "README.md"
 
 [package.metadata.my_custom_tool]
-copyrightyear = "2025" 
+copyrightyear = "2025"
 
 [dependencies]
 crossterm = "0.29.0"
