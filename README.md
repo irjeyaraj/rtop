@@ -37,10 +37,10 @@ Press F1 at any time to bring up in-app help.
 - Direct tab shortcuts: F2 (Dashboard), F3 (top/htop), F12 (Shell)
 - Exit: F10, or press `q` or `Ctrl-C`
 
-Note: On the Shell tab, printable typing (letters, numbers, etc.), Enter, Backspace, and Tab are forwarded to the embedded shell. Vim-style `h`/`l` navigation is disabled there so you can type normally.
+Note: F12 temporarily suspends the TUI and runs your default shell in this terminal. Exit the shell to return to rtop. Vim-style `h`/`l` navigation is disabled while in shell.
 
-## Shell tab
-The Shell tab embeds a PTY: printable characters, Enter, Backspace, and Tab are forwarded to the PTY while on the Shell tab.
+## Shell
+Press F12 to open your system shell directly in the current terminal. When you exit that shell, you’ll return to rtop.
 
 ## Platform support
 rtop targets Linux. Some features (like GPU detection/temperature) are best-effort and depend on available sysfs/proc files and drivers.
@@ -52,4 +52,6 @@ GPL-2.0-or-later. See [LICENSE](LICENSE).
 - [ratatui](https://github.com/ratatui-org/ratatui)
 - [crossterm](https://github.com/crossterm-rs/crossterm)
 - [sysinfo](https://github.com/GuillaumeGomez/sysinfo)
-- [portable-pty](https://github.com/zhiburt/portable-pty)
+
+## Changelog
+See [CHANGELOG.md](CHANGELOG.md).

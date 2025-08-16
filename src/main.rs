@@ -4,8 +4,6 @@
 use std::error::Error;
 use std::io;
 use std::time::{Duration, Instant};
-use std::sync::mpsc::{self, Receiver};
-use std::io::Write as IoWrite;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -15,31 +13,26 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Gauge, Block, Borders, Clear};
 use ratatui::Terminal;
-use sysinfo::{CpuRefreshKind, ProcessRefreshKind, RefreshKind, System};
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
-use std::io::Read;
+use sysinfo::{CpuRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use std::fs;
+use std::process::Command;
 
 /// Global application state shared between the draw loop and input handler.
 ///
-/// Fields capture the current UI selection and popup states, as well as PTY
-/// connections used by the F9 Shell popup.
+/// Fields capture the current UI selection and popup states, as well as cached
+/// detection results to reduce per-frame workload.
 struct App {
     selected_top_tab: usize, // 0: Dashboard, 1: top/htop, 2: Shell
     #[allow(dead_code)]
     selected_proc_tab: usize, // reserved (no Process tab)
-    // Terminal popup state
-    term_popup: bool,
-    term_buf: Vec<String>,
-    term_rx: Option<Receiver<Vec<u8>>>,
-    term_writer: Option<Box<dyn IoWrite + Send>>,
-    term_child: Option<Box<dyn portable_pty::Child + Send>>,
     // Help popup state
     help_popup: bool,
     // Network rate tracking (iface -> (rx_bytes, tx_bytes) and computed rates in bytes/sec)
     net_prev: std::collections::HashMap<String, (u64, u64)>,
     net_rates: std::collections::HashMap<String, (f64, f64)>,
     net_last: Instant,
+    // Cached GPU detection (best-effort; computed once on startup)
+    gpus: Vec<GpuInfo>,
 }
 
 /// Construct the initial application state.
@@ -48,15 +41,11 @@ impl Default for App {
         Self {
             selected_top_tab: 0,
             selected_proc_tab: 0,
-            term_popup: false,
-            term_buf: Vec::new(),
-            term_rx: None,
-            term_writer: None,
-            term_child: None,
             help_popup: false,
             net_prev: std::collections::HashMap::new(),
             net_rates: std::collections::HashMap::new(),
             net_last: Instant::now(),
+            gpus: Vec::new(),
         }
     }
 }
@@ -100,14 +89,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Main application loop: handles periodic refresh, input events, and drawing.
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn Error>> {
     let mut app = App::default();
-    // Start embedded shell PTY so the Shell tab view is live when opened
-    if app.term_rx.is_none() {
-        let _ = start_terminal_popup(&mut app); // reuse PTY setup without showing popup
-        app.term_popup = false; // ensure popup flag stays false
-    }
+    // Cache GPU detection once at startup
+    app.gpus = detect_gpus();
 
     // Prepare sysinfo system with specific refresh kinds to be efficient
-    let refresh = RefreshKind::new()
+    let refresh = RefreshKind::nothing()
         .with_cpu(CpuRefreshKind::everything())
         .with_processes(ProcessRefreshKind::everything());
     let mut sys = System::new_with_specifics(refresh);
@@ -147,37 +133,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
                 app.net_last = now;
             }
         }
-        // Drain terminal output from embedded shell (if running)
-        if let Some(rx) = &app.term_rx {
-            while let Ok(chunk) = rx.try_recv() {
-                // Strip ANSI escapes and push into buffer as UTF-8 text lines
-                let cleaned = strip_ansi_escapes::strip(&chunk);
-                let text = String::from_utf8_lossy(&cleaned);
-                for line in text.split_inclusive('\n') {
-                    if line.ends_with('\n') {
-                        let mut s = line.to_string();
-                        if s.ends_with('\n') { s.pop(); }
-                        app.term_buf.push(s);
-                    } else {
-                        // partial line, append as-is
-                        if let Some(last) = app.term_buf.last_mut() {
-                            last.push_str(line);
-                        } else {
-                            app.term_buf.push(line.to_string());
-                        }
-                    }
-                }
-                // Limit buffer size
-                if app.term_buf.len() > 2000 {
-                    let excess = app.term_buf.len() - 2000;
-                    app.term_buf.drain(0..excess);
-                }
-            }
-        }
 
         // Refresh data periodically
-        sys.refresh_cpu();
-        sys.refresh_processes();
+        sys.refresh_cpu_all();
+        sys.refresh_processes(ProcessesToUpdate::All, true);
         sys.refresh_memory();
 
         // Draw UI
@@ -290,14 +249,11 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         (KeyCode::Char('3'), _) => { app.selected_top_tab = 2; }
         _ => {}
     }
-    // After handling app hotkeys, forward typing keys to embedded shell when on Shell tab
+    // After handling app hotkeys: if Shell tab selected, run system shell directly and return to Dashboard.
     if app.selected_top_tab == 2 {
-        match key.code {
-            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Tab => {
-                forward_key_to_pty(app, key);
-            }
-            _ => {}
-        }
+        run_system_shell()?;
+        // After shell exits, return to Dashboard
+        app.selected_top_tab = 0;
     }
     Ok(false)
 }
@@ -480,109 +436,32 @@ fn default_shell_and_args() -> (String, Vec<String>) {
     (prog, Vec::new())
 }
 
-// Start terminal popup (spawn PTY and reader thread)
-/// Open a PTY and spawn the user shell for the F9 Shell popup.
-fn start_terminal_popup(app: &mut App) -> Result<(), Box<dyn Error>> {
-    if app.term_popup { return Ok(()); }
-    // Clear buffer and setup channel
-    app.term_buf.clear();
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
-    // Open PTY with a reasonable default size
-    let pty_system = NativePtySystem::default();
-    let pair = pty_system.openpty(PtySize { rows: 30, cols: 100, pixel_width: 0, pixel_height: 0 })?;
+/// Run the system shell directly in this terminal, temporarily suspending the TUI.
+fn run_system_shell() -> Result<(), Box<dyn Error>> {
+    // Leave raw mode and alternate screen so the shell can run normally
+    disable_raw_mode()?;
+    let mut out = io::stdout();
+    crossterm::execute!(out, crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen)?;
 
-    // Resolve default shell and spawn it
+    // Spawn the default shell
     let (prog, args) = default_shell_and_args();
-    let mut cmd = CommandBuilder::new(prog);
-    if !args.is_empty() { cmd.args(args); }
-    #[cfg(unix)]
-    {
-        cmd.env("TERM", "xterm-256color");
-    }
-    let child = pair.slave.spawn_command(cmd)?; // Box<dyn Child>
-    drop(pair.slave);
+    let mut cmd = Command::new(&prog);
+    for a in args { cmd.arg(a); }
+    let _status = cmd.status(); // ignore failures silently; user sees messages in terminal
 
-    // Reader thread
-    let mut reader = pair.master.try_clone_reader()?;
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => { let _ = tx.send(buf[..n].to_vec()); },
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Writer
-    let writer = pair.master.take_writer()?; // Box<dyn Write + Send>
-
-    app.term_rx = Some(rx);
-    app.term_writer = Some(writer);
-    app.term_child = Some(child);
-    app.term_popup = true;
+    // Re-enter TUI
+    enable_raw_mode()?;
+    let mut out2 = io::stdout();
+    crossterm::execute!(
+        out2,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    )?;
     Ok(())
 }
 
-/// Close the Shell popup and terminate the child shell process.
-#[allow(dead_code)]
-fn stop_terminal_popup(app: &mut App) {
-    app.term_popup = false;
-    app.term_rx = None;
-    app.term_writer = None;
-    if let Some(mut ch) = app.term_child.take() {
-        let _ = ch.kill();
-        let _ = ch.wait();
-    }
-}
-
-/// Translate a KeyEvent into terminal bytes and send them to the PTY writer.
-fn forward_key_to_pty(app: &mut App, key: KeyEvent) {
-    let mut bytes: Vec<u8> = Vec::new();
-    match key.code {
-        KeyCode::Enter => {
-            // Send newline to the shell and also add a visual new line in the popup buffer
-            bytes.push(b'\n');
-            // Insert an empty line to visually separate the command line from its output
-            app.term_buf.push(String::new());
-        }
-        KeyCode::Backspace => bytes.push(0x7f),
-        KeyCode::Tab => bytes.push(b'\t'),
-        KeyCode::Esc => bytes.push(0x1b),
-        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
-        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
-        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
-        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
-        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
-        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
-        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
-        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
-        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
-        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
-        KeyCode::Char(c) => {
-            // Control modifier to control code
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                let lc = (c as u8).to_ascii_lowercase();
-                let ctrl = lc & 0x1f;
-                bytes.push(ctrl);
-            } else {
-                if key.modifiers.contains(KeyModifiers::ALT) {
-                    bytes.push(0x1b);
-                }
-                if c == '\n' { bytes.push(b'\n'); } else { bytes.extend_from_slice(c.to_string().as_bytes()); }
-            }
-        }
-        _ => {}
-    }
-    if !bytes.is_empty() {
-        if let Some(w) = app.term_writer.as_mut() {
-            let _ = w.write_all(&bytes);
-            let _ = w.flush();
-        }
-    }
-}
 
 /// Helpers to read CPU temperature on Linux from sysfs (hwmon or thermal zones).
 #[cfg(target_os = "linux")]
@@ -708,7 +587,7 @@ fn read_cpu_fan_rpm() -> Option<u32> { None }
 // -------- CPU model helper --------
 fn get_processor_model_string(sys: &System) -> String {
     // Prefer sysinfo brand when available and not "Unknown"
-    let brand = sys.global_cpu_info().brand().to_string();
+    let brand = sys.cpus().first().map(|c| c.brand().to_string()).unwrap_or_default();
     let brand_trim = brand.trim();
     if !brand_trim.is_empty() && brand_trim != "Unknown" {
         return brand_trim.to_string();
@@ -758,7 +637,7 @@ fn get_processor_model_string(sys: &System) -> String {
     }
 
     // Fallback to vendor + brand combo if vendor can help
-    let vendor = sys.global_cpu_info().vendor_id();
+    let vendor = sys.cpus().first().map(|c| c.vendor_id().to_string()).unwrap_or_default();
     if !vendor.is_empty() && vendor != "Unknown" {
         if brand_trim.is_empty() || brand_trim == "Unknown" {
             return vendor.to_string();
@@ -952,7 +831,7 @@ fn draw_header(
 ) {
     // Best-effort CPU temperature (Linux): read from hwmon/thermal sysfs when available
     let cpu_temp_c = read_cpu_temperature_c();
-    let global_cpu = sys.global_cpu_info().cpu_usage(); // percent
+    let global_cpu = sys.global_cpu_usage(); // percent
     let used_mem = sys.used_memory(); // KiB
     let total_mem = sys.total_memory(); // KiB
     let _mem_pct = if total_mem > 0 { (used_mem as f32 / total_mem as f32) * 100.0 } else { 0.0 };
@@ -963,8 +842,8 @@ fn draw_header(
     // CPU tab height: rows for gauges + RAM/SWAP row + 3 separator lines (top/below-mem/bottom)
     let cpu_height = cpu_rows_for_height + 4;
 
-    // Detect GPUs for Graphics tab content sizing
-    let gpus = detect_gpus();
+    // Use cached GPUs for Graphics tab content sizing
+    let gpus = &app.gpus;
     let gfx_height: u16 = (gpus.len() as u16 + 1 + 2).max(3); // header + rows + block borders
     let sys_block_height: u16 = 6 + 2; // 6 info lines (Manufacturer with Hardware Model inline, Processor Model, OS Name, Kernel, OS version, Hostname) + block borders
     let cpu_block_height: u16 = 6 + 2; // 6 info lines + block borders (Cores, Threads, CPU%, Load, Uptime, Temp)
@@ -1253,7 +1132,7 @@ fn draw_header(
                     let minutes = (secs % 3_600) / 60;
                     let seconds = secs % 60;
                     let time_str = if days > 0 { format!("{}d {:02}:{:02}:{:02}", days, hours, minutes, seconds) } else { format!("{:02}:{:02}:{:02}", hours, minutes, seconds) };
-                    let cmd = if !p.cmd().is_empty() { p.cmd().join(" ") } else { p.name().to_string() };
+                    let cmd = if !p.cmd().is_empty() { p.cmd().join(std::ffi::OsStr::new(" ")).to_string_lossy().into_owned() } else { p.name().to_string_lossy().into_owned() };
                     (pid_i, cpu, mem_pct, mem_kib, time_str, cmd)
                 })
                 .collect();
@@ -1356,7 +1235,7 @@ fn draw_header(
 
         // Build CPU info lines for the right frame
         let threads = sys.cpus().len();
-        let cores = sys.physical_core_count().unwrap_or(threads);
+        let cores = System::physical_core_count().unwrap_or(threads);
 
         // CPU frame lines: basic info + usage, load averages, uptime, and temperature
         let load = System::load_average();
@@ -1589,7 +1468,7 @@ fn draw_header(
             lines.push(Line::from(Span::raw("No GPUs detected")));
         } else {
             // Rows
-            for g in &gpus {
+            for g in gpus {
                 let pci = trunc(&g.pci_addr, pci_w);
                 let drv = trunc(&g.driver, driver_w);
                 let ven = trunc(&g.vendor, vendor_w);
@@ -1784,7 +1663,7 @@ fn draw_header(
                     let minutes = (secs % 3_600) / 60;
                     let seconds = secs % 60;
                     let time_str = if days > 0 { format!("{}d {:02}:{:02}:{:02}", days, hours, minutes, seconds) } else { format!("{:02}:{:02}:{:02}", hours, minutes, seconds) };
-                    let cmd = if !p.cmd().is_empty() { p.cmd().join(" ") } else { p.name().to_string() };
+                    let cmd = if !p.cmd().is_empty() { p.cmd().join(std::ffi::OsStr::new(" ")).to_string_lossy().into_owned() } else { p.name().to_string_lossy().into_owned() };
                     (pid_i, cpu, mem_pct, mem_kib, time_str, cmd)
                 })
                 .collect();
@@ -1840,20 +1719,16 @@ fn draw_header(
         }
 
     } else if app.selected_top_tab == 2 {
-        // Shell tab content: framed shell view with auto-scrolling
+        // Shell tab content placeholder: informs the user. Actual shell runs immediately upon selection.
         let block = Block::default().borders(Borders::ALL).title(" Shell ");
         f.render_widget(block, top_area);
-        // Inner area inside the border
         let inner = Rect { x: top_area.x + 1, y: top_area.y + 1, width: top_area.width.saturating_sub(2), height: top_area.height.saturating_sub(2) };
         if inner.width > 0 && inner.height > 0 {
-            let max_lines = inner.height as usize;
-            let start = app.term_buf.len().saturating_sub(max_lines);
-            let slice = &app.term_buf[start..];
-            let mut rendered: Vec<Line> = Vec::with_capacity(slice.len());
-            for s in slice {
-                rendered.push(Line::from(Span::raw(s.clone())));
-            }
-            let paragraph = ratatui::widgets::Paragraph::new(rendered);
+            let msg = vec![
+                Line::from(Span::raw("Opening system shell in this terminal...")),
+                Line::from(Span::raw("When you exit the shell, you will return to rtop.")),
+            ];
+            let paragraph = ratatui::widgets::Paragraph::new(msg);
             f.render_widget(paragraph, inner);
         }
     }
@@ -1909,54 +1784,6 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     f.render_widget(paragraph, area);
 }
 
-// Terminal popup drawing
-/// Draw the F9 Shell popup with a visible cursor and scrollback from term_buf.
-#[allow(dead_code)]
-fn draw_terminal_popup(f: &mut ratatui::Frame<'_>, size: Rect, app: &App) {
-    // Centered area occupying ~80% width, ~70% height
-    let popup_w = (size.width as f32 * 0.8) as u16;
-    let popup_h = (size.height as f32 * 0.7) as u16;
-    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
-    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
-    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
-
-    // Clear area and draw border
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Shell (F9 to close) ")
-        .border_style(Style::default().fg(Color::Red))
-        .style(Style::default().bg(Color::Black));
-    f.render_widget(block, area);
-
-    // Inner area
-    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
-
-    // Compute how many lines fit and take from the end of buffer
-    let max_lines = inner.height as usize;
-    let start = app.term_buf.len().saturating_sub(max_lines);
-    let slice = &app.term_buf[start..];
-    let mut rendered: Vec<Line> = Vec::with_capacity(slice.len());
-    for s in slice {
-        rendered.push(Line::from(Span::raw(s.clone())));
-    }
-    let paragraph = ratatui::widgets::Paragraph::new(rendered).style(Style::default().fg(Color::White).bg(Color::Black));
-    f.render_widget(paragraph, inner);
-
-    // Place a visible cursor at the end of the last visible line inside the popup
-    let mut cur_x = inner.x;
-    let mut cur_y = inner.y;
-    if !slice.is_empty() {
-        let last_idx = slice.len().saturating_sub(1) as u16;
-        cur_y = inner.y.saturating_add(last_idx.min(inner.height.saturating_sub(1)));
-        let last_line = slice.last().unwrap();
-        // Approximate display width; for simplicity, count chars (may differ for wide glyphs)
-        let mut w = last_line.chars().count() as u16;
-        if w > inner.width.saturating_sub(1) { w = inner.width.saturating_sub(1); }
-        cur_x = inner.x.saturating_add(w);
-    }
-    f.set_cursor_position((cur_x, cur_y));
-}
 
 // Help popup drawing (F1)
 /// Draw the F1 Help popup with multiline content and a cyan border + shadow.
@@ -1970,7 +1797,7 @@ fn draw_help_popup(f: &mut ratatui::Frame<'_>, size: Rect) {
         Line::from(Span::raw("Navigation and hotkeys:")),
         Line::from(Span::raw("    - Left/Right, h/l, Tab/BackTab, or 1/2/3 to switch top tabs.")),
         Line::from(Span::raw("    - Home Dashboard, End last tab, PgDn previous tab, PgUp next tab.")),
-        Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F12 Shell tab.")), 
+        Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F12 Shell (opens your system shell; exit to return).")), 
         Line::from(Span::raw("    - F10 exit app.")), 
         Line::from(Span::raw("    - q or Ctrl-C quits.")),
     ];
