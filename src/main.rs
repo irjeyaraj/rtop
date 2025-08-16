@@ -15,7 +15,104 @@ use ratatui::widgets::{Gauge, Block, Borders, Clear};
 use ratatui::Terminal;
 use sysinfo::{CpuRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use std::fs;
-use std::process::Command;
+use std::io::{Write, Read};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+/// A running embedded shell backed by a PTY, with an output buffer.
+struct ShellSession {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Option<Box<dyn std::io::Write + Send>>, 
+    child: Box<dyn portable_pty::Child + Send>,
+    buf: Arc<Mutex<Vec<u8>>>,
+}
+
+impl ShellSession {
+    fn spawn(rows: u16, cols: u16) -> Option<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .ok()?;
+        let master = pair.master;
+        let cmd_builder = {
+            let (prog, args) = default_shell_and_args();
+            let mut b = CommandBuilder::new(prog);
+            for a in args { b.arg(a); }
+            b.env("TERM", std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()));
+            b
+        };
+        let child = pair.slave.spawn_command(cmd_builder).ok()?;
+        let writer = master.take_writer().ok();
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        // Reader thread to capture output
+        {
+            let mut reader = master.try_clone_reader().ok()?;
+            let buf_clone = buf.clone();
+            thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match reader.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            if let Ok(mut b) = buf_clone.lock() {
+                                b.extend_from_slice(&chunk[..n]);
+                                // Trim buffer if huge to prevent unbounded growth
+                                if b.len() > 512 * 1024 {
+                                    let keep = 256 * 1024;
+                                    let start = b.len() - keep;
+                                    b.drain(0..start);
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        Some(Self { master, writer, child, buf })
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        if let Some(w) = self.writer.as_mut() {
+            let _ = w.write_all(bytes);
+            let _ = w.flush();
+        }
+    }
+
+    fn read_stripped_lines(&self, width: usize, height: usize) -> Vec<String> {
+        use strip_ansi_escapes::strip;
+        let data = self.buf.lock().ok().map(|b| b.clone()).unwrap_or_default();
+        let stripped = strip(&data);
+        let text = String::from_utf8_lossy(&stripped);
+        let mut lines: Vec<String> = text.split_inclusive(['\n']).map(|s| s.to_string()).collect();
+        if lines.is_empty() { lines.push(String::new()); }
+        // Wrap very long lines to width best-effort
+        let mut wrapped: Vec<String> = Vec::new();
+        for l in lines {
+            if width == 0 { wrapped.push(l); continue; }
+            let mut cur = l;
+            while cur.len() > width {
+                wrapped.push(cur[..width].to_string());
+                cur = cur[width..].to_string();
+            }
+            wrapped.push(cur);
+        }
+        // Keep only last height lines to fit viewport
+        let len = wrapped.len();
+        if height > 0 && len > height { wrapped[len - height..].to_vec() } else { wrapped }
+    }
+
+
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+    }
+}
 
 /// Global application state shared between the draw loop and input handler.
 ///
@@ -33,6 +130,8 @@ struct App {
     net_last: Instant,
     // Cached GPU detection (best-effort; computed once on startup)
     gpus: Vec<GpuInfo>,
+    // Embedded shell session (PTY) for the Shell tab
+    shell: Option<ShellSession>,
 }
 
 /// Construct the initial application state.
@@ -46,6 +145,7 @@ impl Default for App {
             net_rates: std::collections::HashMap::new(),
             net_last: Instant::now(),
             gpus: Vec::new(),
+            shell: None,
         }
     }
 }
@@ -172,7 +272,17 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
                     if handle_key(key, &mut app)? { break; }
                 }
                 Event::Resize(_, _) => {
-                    // nothing specific; redraw handles layout
+                    if app.selected_top_tab == 2 {
+                        if let Some(sess) = app.shell.as_mut() {
+                            // Approximate inner area: full size minus menu and borders
+                            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                            let rows = rows.saturating_sub(3); // account for menu and borders
+                            let cols = cols.saturating_sub(2);
+                            let rows = rows.max(1);
+                            let cols = cols.max(1);
+                            sess.resize(rows, cols);
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -197,8 +307,60 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         }
     }
 
+    // If Shell tab active, forward most keys to the PTY instead of handling as app hotkeys
+    if app.selected_top_tab == 2 {
+        // Ensure shell session exists
+        if app.shell.is_none() {
+            // Spawn with a reasonable default size; will be resized on draw
+            app.shell = ShellSession::spawn(24, 80);
+        }
+        if let Some(sess) = app.shell.as_mut() {
+            // Handle a few app-level escapes while in shell
+            match (key.code, key.modifiers) {
+                (KeyCode::F(10), _) => return Ok(true), // allow F10 to exit app
+                (KeyCode::F(1), _) => { app.help_popup = !app.help_popup; return Ok(false); }
+                // Otherwise, forward to shell
+                _ => {}
+            }
+            // Map KeyEvent to bytes and write to PTY
+            match (key.code, key.modifiers) {
+                (KeyCode::Char(c), KeyModifiers::CONTROL) => {
+                    // Control-letter -> 0x01..0x1A when applicable
+                    let uc = c.to_ascii_uppercase();
+                    if uc >= 'A' && uc <= 'Z' {
+                        let b = (uc as u8 - b'@') as u8;
+                        sess.write_bytes(&[b]);
+                    }
+                }
+                (KeyCode::Char(c), _) => {
+                    let s = c.to_string();
+                    let bytes = s.as_bytes();
+                    sess.write_bytes(bytes);
+                }
+                (KeyCode::Enter, _) => sess.write_bytes(&[b'\n']),
+                (KeyCode::Backspace, _) => sess.write_bytes(&[0x7f]),
+                (KeyCode::Tab, _) => sess.write_bytes(&[b'\t']),
+                (KeyCode::Esc, _) => sess.write_bytes(&[0x1b]),
+                (KeyCode::Left, _) => sess.write_bytes(b"\x1b[D"),
+                (KeyCode::Right, _) => sess.write_bytes(b"\x1b[C"),
+                (KeyCode::Up, _) => sess.write_bytes(b"\x1b[A"),
+                (KeyCode::Down, _) => sess.write_bytes(b"\x1b[B"),
+                (KeyCode::Home, _) => sess.write_bytes(b"\x1b[H"),
+                (KeyCode::End, _) => sess.write_bytes(b"\x1b[F"),
+                (KeyCode::PageUp, _) => sess.write_bytes(b"\x1b[5~"),
+                (KeyCode::PageDown, _) => sess.write_bytes(b"\x1b[6~"),
+                (KeyCode::Delete, _) => sess.write_bytes(b"\x1b[3~"),
+                (KeyCode::Insert, _) => sess.write_bytes(b"\x1b[2~"),
+                // Ignore other keys
+                _ => {}
+            }
+            return Ok(false);
+        }
+    }
+
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
+        (KeyCode::Char('q'), _) => return Ok(true),
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(true),
         // Function keys hotkeys
         (KeyCode::F(10), _) => return Ok(true), // F10 exit
         (KeyCode::F(9), _) => { /* intentionally unmapped */ }
@@ -249,12 +411,12 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         (KeyCode::Char('3'), _) => { app.selected_top_tab = 2; }
         _ => {}
     }
-    // After handling app hotkeys: if Shell tab selected, run system shell directly and return to Dashboard.
-    if app.selected_top_tab == 2 {
-        run_system_shell()?;
-        // After shell exits, return to Dashboard
-        app.selected_top_tab = 0;
+
+    // If we just left the Shell tab, terminate the session
+    if app.selected_top_tab != 2 {
+        if let Some(mut sess) = app.shell.take() { sess.terminate(); }
     }
+
     Ok(false)
 }
 
@@ -437,30 +599,6 @@ fn default_shell_and_args() -> (String, Vec<String>) {
 }
 
 
-/// Run the system shell directly in this terminal, temporarily suspending the TUI.
-fn run_system_shell() -> Result<(), Box<dyn Error>> {
-    // Leave raw mode and alternate screen so the shell can run normally
-    disable_raw_mode()?;
-    let mut out = io::stdout();
-    crossterm::execute!(out, crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen)?;
-
-    // Spawn the default shell
-    let (prog, args) = default_shell_and_args();
-    let mut cmd = Command::new(&prog);
-    for a in args { cmd.arg(a); }
-    let _status = cmd.status(); // ignore failures silently; user sees messages in terminal
-
-    // Re-enter TUI
-    enable_raw_mode()?;
-    let mut out2 = io::stdout();
-    crossterm::execute!(
-        out2,
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::cursor::Hide,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
-    )?;
-    Ok(())
-}
 
 
 /// Helpers to read CPU temperature on Linux from sysfs (hwmon or thermal zones).
@@ -1719,17 +1857,26 @@ fn draw_header(
         }
 
     } else if app.selected_top_tab == 2 {
-        // Shell tab content placeholder: informs the user. Actual shell runs immediately upon selection.
         let block = Block::default().borders(Borders::ALL).title(" Shell ");
         f.render_widget(block, top_area);
         let inner = Rect { x: top_area.x + 1, y: top_area.y + 1, width: top_area.width.saturating_sub(2), height: top_area.height.saturating_sub(2) };
         if inner.width > 0 && inner.height > 0 {
-            let msg = vec![
-                Line::from(Span::raw("Opening system shell in this terminal...")),
-                Line::from(Span::raw("When you exit the shell, you will return to rtop.")),
-            ];
-            let paragraph = ratatui::widgets::Paragraph::new(msg);
-            f.render_widget(paragraph, inner);
+            // Ensure shell is running and resized to fit the inner area
+            let rows = inner.height.max(1);
+            let cols = inner.width.max(1);
+            // If a shell session exists, render its content
+            if let Some(sess) = app.shell.as_ref() {
+                let lines = sess.read_stripped_lines(cols as usize, rows as usize);
+                let text_lines: Vec<Line> = lines.into_iter().map(|l| Line::from(Span::raw(l))).collect();
+                let paragraph = ratatui::widgets::Paragraph::new(text_lines);
+                f.render_widget(paragraph, inner);
+            } else {
+                let msg = vec![
+                    Line::from(Span::raw("Press F12 to start the shell.")),
+                ];
+                let paragraph = ratatui::widgets::Paragraph::new(msg);
+                f.render_widget(paragraph, inner);
+            }
         }
     }
 }
@@ -1797,9 +1944,9 @@ fn draw_help_popup(f: &mut ratatui::Frame<'_>, size: Rect) {
         Line::from(Span::raw("Navigation and hotkeys:")),
         Line::from(Span::raw("    - Left/Right, h/l, Tab/BackTab, or 1/2/3 to switch top tabs.")),
         Line::from(Span::raw("    - Home Dashboard, End last tab, PgDn previous tab, PgUp next tab.")),
-        Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F12 Shell (opens your system shell; exit to return).")), 
-        Line::from(Span::raw("    - F10 exit app.")), 
-        Line::from(Span::raw("    - q or Ctrl-C quits.")),
+        Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F12 Shell (embedded PTY).")),
+        Line::from(Span::raw("    - In Shell tab: keys go to your shell; Ctrl-C is sent to the shell (F10 exits app).")),
+        Line::from(Span::raw("    - F10 exit app; q also exits.")), 
     ];
 
     // Compute popup width: max text width + 1 space padding + 4 (borders)

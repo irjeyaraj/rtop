@@ -4,8 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is Keep a Changelog–inspired, with dates in YYYY-MM-DD.
 
+## [0.1.4] - 2025-08-16
+- Feature: Embedded Shell tab implemented using a PTY; the shell runs inside the Shell tab.
+- Input: While in Shell, most keys are forwarded to the shell; Ctrl-C goes to the shell (F10 still exits the app).
+- UX: PTY resizes on terminal resize; leaving the Shell tab terminates the session to avoid leaks.
+- Cleanup: Removed unused legacy run_system_shell() and related code; cleared compiler warnings.
+- Docs: README and in-app Help updated for embedded shell behavior.
+
 ## [0.1.3] - 2025-08-16
-- Cleanup: Removed legacy PTY-related code and the portable-pty dependency; Shell uses the system terminal exclusively.
 - Optimization: Cache GPU detection at startup instead of every frame.
 - Docs: Updated README Credits and Help remain accurate.
 - Misc: Minor internal cleanups.

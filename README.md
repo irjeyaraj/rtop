@@ -35,12 +35,12 @@ Press F1 at any time to bring up in-app help.
 - Switch top tabs: Left/Right, h/l, Tab/BackTab, or 1/2/3
 - Quick navigation: Home (Dashboard), End (last tab), PgDn (previous tab), PgUp (next tab)
 - Direct tab shortcuts: F2 (Dashboard), F3 (top/htop), F12 (Shell)
-- Exit: F10, or press `q` or `Ctrl-C`
+- Exit: F10, or press `q`
 
-Note: F12 temporarily suspends the TUI and runs your default shell in this terminal. Exit the shell to return to rtop. Vim-style `h`/`l` navigation is disabled while in shell.
+Note: F12 opens an embedded shell (PTY) inside the Shell tab. While on the Shell tab, most keys are forwarded to your shell. Ctrl-C is sent to the shell (it will not quit rtop). Use F10 to exit the app. Vim-style `h`/`l` navigation is disabled while in shell so you can type normally.
 
 ## Shell
-Press F12 to open your system shell directly in the current terminal. When you exit that shell, you’ll return to rtop.
+Press F12 to switch to the Shell tab and use your system shell embedded within rtop. When you leave the Shell tab or exit the shell process, you’ll return to the rest of rtop. If the shell exits, press F12 again to start a new session.
 
 ## Platform support
 rtop targets Linux. Some features (like GPU detection/temperature) are best-effort and depend on available sysfs/proc files and drivers.
