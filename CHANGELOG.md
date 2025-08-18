@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is Keep a Changelog–inspired, with dates in YYYY-MM-DD.
 
+## [0.1.5] - 2025-08-18
+- Fix: Removed unused functions (run_command_capture, draw_command_prompt, draw_command_result_popup) to eliminate compiler warnings.
+- Fix: Removed unnecessary mutable variables and dead code warnings.
+- Logs: Exclude /var/log/journal from Logs tab listing.
+- Shell: Added a one-line system prompt banner in the Shell tab for context.
+- Docs: Updated in-app Help and README to reflect current navigation and table keybindings.
+- Meta: Bumped version to 0.1.5.
+
 ## [0.1.4] - 2025-08-16
 - Feature: Embedded Shell tab implemented using a PTY; the shell runs inside the Shell tab.
 - Input: While in Shell, most keys are forwarded to the shell; Ctrl-C goes to the shell (F10 still exits the app).

@@ -36,7 +36,7 @@ Press F1 at any time to bring up in-app help.
 
 ### Controls (summary)
 - Switch top tabs: Left/Right, h/l, Tab/BackTab, or 1/2/3/4/5
-- Quick navigation: Home (Dashboard), End (last tab), PgDn (previous tab), PgUp (next tab)
+- In tables (Processes/Services/Logs): Home/End jump to first/last; PgUp/PgDn move selection by 10
 - Direct tab shortcuts: F2 (Dashboard), F3 (top/htop), F4 (Services), F5 (Logs), F12 (Shell)
 - Context actions: Enter on Services/Processes/Logs tables opens a details/content popup; Esc or Enter closes popups
 - Exit: F10, or press `q`

@@ -114,6 +114,14 @@ impl ShellSession {
     fn terminate(&mut self) {
         let _ = self.child.kill();
     }
+
+    fn is_exited(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_status)) => true,
+            Ok(None) => false,
+            Err(_e) => false,
+        }
+    }
 }
 
 /// Global application state shared between the draw loop and input handler.
@@ -121,7 +129,7 @@ impl ShellSession {
 /// Fields capture the current UI selection and popup states, as well as cached
 /// detection results to reduce per-frame workload.
 struct App {
-    selected_top_tab: usize, // 0: Dashboard, 1: top/htop, 2: Services, 3: Shell
+    selected_top_tab: usize, // 0: Dashboard, 1: top/htop, 2: Services, 3: Shell, 4: Logs
     #[allow(dead_code)]
     selected_proc_tab: usize, // reserved (no Process tab)
     // Help popup state
@@ -176,7 +184,7 @@ impl Default for App {
             net_rates: std::collections::HashMap::new(),
             net_last: Instant::now(),
             gpus: Vec::new(),
-            shell: None,
+            shell: None, 
             services_scroll: 0,
             services_selected: 0,
             service_popup: false,
@@ -310,6 +318,27 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
             }
         }
 
+        // Ensure shell session lifecycle and sizing
+        if app.selected_top_tab == 3 {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            let rows = rows.saturating_sub(3); // account for menu and borders
+            let cols = cols.saturating_sub(2);
+            let rows = rows.max(1);
+            let cols = cols.max(1);
+            if app.shell.is_none() {
+                app.shell = ShellSession::spawn(rows, cols);
+            }
+            if let Some(sess) = app.shell.as_mut() {
+                // If shell exited (logout), return to Dashboard
+                if sess.is_exited() {
+                    let _ = app.shell.take();
+                    app.selected_top_tab = 0;
+                } else {
+                    sess.resize(rows, cols);
+                }
+            }
+        }
+
         // Draw UI
         terminal.draw(|f| {
             let size = f.area();
@@ -357,7 +386,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
                 Event::Resize(_, _) => {
                     if app.selected_top_tab == 3 {
                         if let Some(sess) = app.shell.as_mut() {
-                            // Approximate inner area: full size minus menu and borders
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                             let rows = rows.saturating_sub(3); // account for menu and borders
                             let cols = cols.saturating_sub(2);
@@ -464,25 +492,24 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         }
     }
 
+
+
     // If Shell tab active, forward most keys to the PTY instead of handling as app hotkeys
     if app.selected_top_tab == 3 {
         // Ensure shell session exists
         if app.shell.is_none() {
-            // Spawn with a reasonable default size; will be resized on draw
             app.shell = ShellSession::spawn(24, 80);
         }
         if let Some(sess) = app.shell.as_mut() {
-            // Handle a few app-level escapes while in shell
+            // Allow a couple of app-level keys
             match (key.code, key.modifiers) {
-                (KeyCode::F(10), _) => return Ok(true), // allow F10 to exit app
+                (KeyCode::F(10), _) => return Ok(true), // exit app
                 (KeyCode::F(1), _) => { app.help_popup = !app.help_popup; return Ok(false); }
-                // Otherwise, forward to shell
                 _ => {}
             }
-            // Map KeyEvent to bytes and write to PTY
+            // Forward key to shell
             match (key.code, key.modifiers) {
                 (KeyCode::Char(c), KeyModifiers::CONTROL) => {
-                    // Control-letter -> 0x01..0x1A when applicable
                     let uc = c.to_ascii_uppercase();
                     if uc >= 'A' && uc <= 'Z' {
                         let b = (uc as u8 - b'@') as u8;
@@ -491,8 +518,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
                 }
                 (KeyCode::Char(c), _) => {
                     let s = c.to_string();
-                    let bytes = s.as_bytes();
-                    sess.write_bytes(bytes);
+                    sess.write_bytes(s.as_bytes());
                 }
                 (KeyCode::Enter, _) => sess.write_bytes(&[b'\n']),
                 (KeyCode::Backspace, _) => sess.write_bytes(&[0x7f]),
@@ -508,7 +534,6 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
                 (KeyCode::PageDown, _) => sess.write_bytes(b"\x1b[6~"),
                 (KeyCode::Delete, _) => sess.write_bytes(b"\x1b[3~"),
                 (KeyCode::Insert, _) => sess.write_bytes(b"\x1b[2~"),
-                // Ignore other keys
                 _ => {}
             }
             return Ok(false);
@@ -524,6 +549,26 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
             }
             KeyCode::Down => {
                 app.procs_selected = app.procs_selected.saturating_add(1);
+                return Ok(false);
+            }
+            KeyCode::Home => {
+                app.procs_selected = 0;
+                return Ok(false);
+            }
+            KeyCode::End => {
+                if !app.procs_pids_sorted.is_empty() {
+                    app.procs_selected = app.procs_pids_sorted.len().saturating_sub(1);
+                }
+                return Ok(false);
+            }
+            KeyCode::PageUp => {
+                let step: usize = 10;
+                app.procs_selected = app.procs_selected.saturating_sub(step);
+                return Ok(false);
+            }
+            KeyCode::PageDown => {
+                let step: usize = 10;
+                app.procs_selected = app.procs_selected.saturating_add(step);
                 return Ok(false);
             }
             KeyCode::Enter => {
@@ -566,6 +611,36 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
                 }
                 return Ok(false);
             }
+            KeyCode::Home => {
+                app.services_selected = 0;
+                return Ok(false);
+            }
+            KeyCode::End => {
+                #[cfg(target_os = "linux")]
+                {
+                    let total = get_all_services().len();
+                    if total > 0 { app.services_selected = total.saturating_sub(1); }
+                }
+                return Ok(false);
+            }
+            KeyCode::PageUp => {
+                let step: usize = 10;
+                app.services_selected = app.services_selected.saturating_sub(step);
+                return Ok(false);
+            }
+            KeyCode::PageDown => {
+                let step: usize = 10;
+                app.services_selected = app.services_selected.saturating_add(step);
+                #[cfg(target_os = "linux")]
+                {
+                    let total = get_all_services().len();
+                    if total > 0 {
+                        let max_idx = total.saturating_sub(1);
+                        if app.services_selected > max_idx { app.services_selected = max_idx; }
+                    }
+                }
+                return Ok(false);
+            }
             KeyCode::Enter => {
                 // Open popup with selected service details
                 #[cfg(target_os = "linux")]
@@ -596,6 +671,22 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         match key.code {
             KeyCode::Up => { if app.logs_selected > 0 { app.logs_selected -= 1; } return Ok(false); }
             KeyCode::Down => { app.logs_selected = app.logs_selected.saturating_add(1); return Ok(false); }
+            KeyCode::Home => { app.logs_selected = 0; return Ok(false); }
+            KeyCode::End => {
+                let total = list_var_log_files().len();
+                if total > 0 { app.logs_selected = total.saturating_sub(1); }
+                return Ok(false);
+            }
+            KeyCode::PageUp => { let step: usize = 10; app.logs_selected = app.logs_selected.saturating_sub(step); return Ok(false); }
+            KeyCode::PageDown => {
+                let step: usize = 10; app.logs_selected = app.logs_selected.saturating_add(step);
+                let total = list_var_log_files().len();
+                if total > 0 {
+                    let max_idx = total.saturating_sub(1);
+                    if app.logs_selected > max_idx { app.logs_selected = max_idx; }
+                }
+                return Ok(false);
+            }
             KeyCode::Enter => {
                 // Build file list and attempt to read selected file
                 let files = list_var_log_files();
@@ -645,39 +736,31 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         // F6 intentionally left unmapped
         (KeyCode::F(11), _) => { /* intentionally unmapped */ }
         (KeyCode::F(12), _) => { app.selected_top_tab = 3; } // F12 Shell tab
-        // Top tabs navigation
-        (KeyCode::Home, _) => { app.selected_top_tab = 0; } // Home -> Dashboard
-        (KeyCode::End, _) => { app.selected_top_tab = 4; }  // End -> last tab (Logs)
-        (KeyCode::PageDown, _) => { // PgDn -> move backward (previous tab)
-            app.selected_top_tab = (app.selected_top_tab + 4) % 5; // -1 mod 5
-        }
-        (KeyCode::PageUp, _) => { // PgUp -> move forward (next tab)
-            app.selected_top_tab = (app.selected_top_tab + 1) % 5;
-        }
+        // Top tabs navigation (Left/Right, Tab/BackTab, number keys)
         (KeyCode::Left, _) => {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
         (KeyCode::Right, _) => {
             if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
         }
-        // Vim-style: h = left, l = right (disabled on Shell tab to allow typing)
-        (KeyCode::Char('h'), _) if app.selected_top_tab != 3 => {
+        // Vim-style: h = left, l = right
+        (KeyCode::Char('h'), _) => {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
-        (KeyCode::Char('H'), _) if app.selected_top_tab != 3 => {
+        (KeyCode::Char('H'), _) => {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
-        (KeyCode::Char('l'), _) if app.selected_top_tab != 3 => {
+        (KeyCode::Char('l'), _) => {
             if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
         }
-        (KeyCode::Char('L'), _) if app.selected_top_tab != 3 => {
+        (KeyCode::Char('L'), _) => {
             if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
         }
         (KeyCode::Tab, _) => {
             app.selected_top_tab = (app.selected_top_tab + 1) % 5;
         }
         (KeyCode::BackTab, _) => {
-            app.selected_top_tab = (app.selected_top_tab + 4) % 5; // equivalent to -1 mod 5
+            app.selected_top_tab = (app.selected_top_tab + 4) % 5; // -1 mod 5
         }
         (KeyCode::Char('1'), _) => { app.selected_top_tab = 0; }
         (KeyCode::Char('2'), _) => { app.selected_top_tab = 1; }
@@ -1396,6 +1479,8 @@ fn list_var_log_files() -> Vec<LogEntry> {
     }
 
     while let Some(p) = stack.pop() {
+        // Skip systemd journal binary logs entirely
+        if p.starts_with(root.join("journal")) { continue; }
         // Use symlink_metadata to decide what to do without following dir symlinks
         let md = match fs::symlink_metadata(&p) { Ok(m) => m, Err(_) => continue };
         if md.is_file() {
@@ -1447,6 +1532,25 @@ fn fmt_system_time(st: std::time::SystemTime) -> String {
         }
         Err(_) => String::from("-"),
     }
+}
+
+// Build a simple "user@hostname" system prompt string (best effort, no extra deps).
+fn get_hostname_best_effort() -> String {
+    // Try Linux-specific files first
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let t = s.trim();
+            if !t.is_empty() { return t.to_string(); }
+        }
+    }
+    if let Ok(h) = std::env::var("HOSTNAME") { if !h.trim().is_empty() { return h; } }
+    String::from("host")
+}
+
+fn build_system_prompt() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| String::from("user"));
+    let host = get_hostname_best_effort();
+    format!("{}@{}", user, host)
 }
 
 fn read_log_file_best_effort(path: &str, sudo_pass: Option<&str>) -> Result<String, String> {
@@ -1503,6 +1607,7 @@ fn cap_log_text(s: &mut String) {
         *s = tail.join("\n");
     }
 }
+
 
 // -------- Applications detection helpers --------
 fn is_cmd_in_path(bin: &str) -> bool {
@@ -1653,7 +1758,7 @@ fn draw_header(
     let disks_block_height: u16 = (disks.len() as u16 + 1 + 2).max(3); // header + rows + borders
     let proc_block_height: u16 = 12; // Process frame fixed height (inner ~10 rows) + borders
 
-    // Decide current top content height based on selected tab (0 = Dashboard, 1 = top/htop, 2 = Shell)
+    // Decide current top content height based on selected tab (0 = Dashboard, 1 = top/htop, 2 = Services, 4 = Logs)
     let top_content_height = match app.selected_top_tab {
         0 => top_frames_height + gfx_height + disks_block_height + proc_block_height,
         1 => cpu_height,
@@ -1663,8 +1768,8 @@ fn draw_header(
         _ => cpu_height,
     };
 
-    // Layout: remove visual top Tabs bar and use full area for content; for Dashboard, top/htop, Services, Logs, and Shell, allow content to fill remaining space
-    let constraints = if app.selected_top_tab == 0 || app.selected_top_tab == 1 || app.selected_top_tab == 2 || app.selected_top_tab == 3 || app.selected_top_tab == 4 {
+    // Layout: remove visual top Tabs bar and use full area for content for known tabs
+    let constraints = if matches!(app.selected_top_tab, 0 | 1 | 2 | 3 | 4) {
         [
             Constraint::Min(5),    // content fills remaining space
         ]
@@ -2576,25 +2681,40 @@ fn draw_header(
             }
         }
     } else if app.selected_top_tab == 3 {
+        // Shell tab
         let block = Block::default().borders(Borders::ALL).title(" Shell ");
         f.render_widget(block, top_area);
         let inner = Rect { x: top_area.x + 1, y: top_area.y + 1, width: top_area.width.saturating_sub(2), height: top_area.height.saturating_sub(2) };
         if inner.width > 0 && inner.height > 0 {
-            // Ensure shell is running and resized to fit the inner area
-            let rows = inner.height.max(1);
-            let cols = inner.width.max(1);
-            // If a shell session exists, render its content
+            // Split into a 1-line prompt bar and the PTY content area
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // prompt line
+                    Constraint::Min(1),    // PTY content
+                ])
+                .split(inner);
+            // Render prompt bar
+            let prompt = build_system_prompt();
+            let prompt_line = Line::from(Span::styled(format!(" {} ", prompt), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            let prompt_par = ratatui::widgets::Paragraph::new(prompt_line);
+            f.render_widget(prompt_par, parts[0]);
+
+            // Render PTY content beneath the prompt
+            let content_area = parts[1];
             if let Some(sess) = app.shell.as_ref() {
+                let rows = content_area.height.max(1);
+                let cols = content_area.width.max(1);
                 let lines = sess.read_stripped_lines(cols as usize, rows as usize);
                 let text_lines: Vec<Line> = lines.into_iter().map(|l| Line::from(Span::raw(l))).collect();
                 let paragraph = ratatui::widgets::Paragraph::new(text_lines);
-                f.render_widget(paragraph, inner);
+                f.render_widget(paragraph, content_area);
             } else {
                 let msg = vec![
                     Line::from(Span::raw("Press F12 to start the shell.")),
                 ];
                 let paragraph = ratatui::widgets::Paragraph::new(msg);
-                f.render_widget(paragraph, inner);
+                f.render_widget(paragraph, content_area);
             }
         }
     } else if app.selected_top_tab == 4 {
@@ -2654,7 +2774,7 @@ fn draw_header(
 /// Draw the function key menu bar (F1..F10) along the bottom.
 fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // Menu bar with function keys
-    // F2: Dashboard, F3: top/htop, F4: Services (SystemD), F10: Exit, F12: Shell tab
+    // F2: Dashboard, F3: top/htop, F4: Services (SystemD), F5: Logs, F10: Exit, F12: Shell
     // Fill background with a lighter blue for the entire menu area
     let bg = Block::default().style(Style::default().bg(Color::LightBlue));
     f.render_widget(bg, area);
@@ -2716,10 +2836,10 @@ fn draw_help_popup(f: &mut ratatui::Frame<'_>, size: Rect) {
         Line::from(Span::raw(format!("License: {}", env!("CARGO_PKG_LICENSE")))),
         Line::from(Span::raw(" ")),
         Line::from(Span::raw("Navigation and hotkeys:")),
-        Line::from(Span::raw("    - Left/Right, h/l, Tab/BackTab, or 1/2/3/4/5 to switch top tabs.")),
-        Line::from(Span::raw("    - Home Dashboard, End last tab, PgDn previous tab, PgUp next tab.")),
+        Line::from(Span::raw("    - Switch tabs: Left/Right, h/l, Tab/BackTab, or 1/2/3/4/5.")),
+        Line::from(Span::raw("    - In tables (Processes/Services/Logs): Home/End jump to first/last; PgUp/PgDn move by 10.")),
         Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F4 Services (SystemD), F5 Logs, F12 Shell (embedded PTY).")),
-        Line::from(Span::raw("    - In Shell tab: keys go to your shell; Ctrl-C is sent to the shell (F10 exits app).")),
+        Line::from(Span::raw("    - In Shell tab: keys go to your shell; Ctrl-C is sent to the shell (F10 exits app).")), 
         Line::from(Span::raw("    - F10 exit app; q also exits.")), 
     ];
 
@@ -2939,3 +3059,5 @@ fn draw_logs_password_prompt(f: &mut ratatui::Frame<'_>, size: Rect, error_text:
     let paragraph = ratatui::widgets::Paragraph::new(display_lines);
     f.render_widget(paragraph, inner);
 }
+
+
