@@ -13,15 +13,17 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, Block, Borders, Clear, Table, Row, Cell};
+use ratatui::widgets::{Gauge, Block, Borders, Table, Row, Cell};
 use ratatui::Terminal;
 use sysinfo::{CpuRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use std::fs;
 
 mod shell;
 mod app;
+mod ui_popups;
 use app::App;
 use shell::ShellSession;
+use ui_popups::{draw_help_popup, draw_service_popup, draw_process_popup, draw_log_popup, draw_logs_password_prompt};
 
 
 
@@ -180,7 +182,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), 
                 draw_process_popup(f, size, &app.process_detail_title, &app.process_detail_text);
             }
             if app.log_popup {
-                draw_log_popup(f, size, &app.log_detail_title, &app.log_detail_text);
+                draw_log_popup(f, size, &app.log_detail_title, &app.log_detail_text, app.log_popup_scroll);
             }
             if app.logs_password_prompt {
                 draw_logs_password_prompt(f, size, &app.logs_password_error, app.logs_password_input.chars().count());
@@ -252,11 +254,51 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
             _ => {}
         }
     }
-    // Close log content popup on Esc or Enter
+    // Log/Journal popup: scrolling and close
     if app.log_popup {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
                 app.log_popup = false;
+                app.log_popup_scroll = 0;
+                return Ok(false);
+            }
+            KeyCode::Up | KeyCode::Left => {
+                if app.log_popup_scroll > 0 { app.log_popup_scroll -= 1; }
+                return Ok(false);
+            }
+            KeyCode::Down | KeyCode::Right => {
+                // compute visible rows and clamp
+                let (_, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                let vis = term_h.saturating_sub(2) as usize; // inner height (popup borders)
+                let total = app.log_detail_text.lines().count();
+                let max_start = total.saturating_sub(vis);
+                if app.log_popup_scroll < max_start { app.log_popup_scroll += 1; }
+                return Ok(false);
+            }
+            KeyCode::PageUp => {
+                let (_, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                let vis = term_h.saturating_sub(2) as usize;
+                app.log_popup_scroll = app.log_popup_scroll.saturating_sub(vis.max(1));
+                return Ok(false);
+            }
+            KeyCode::PageDown => {
+                let (_, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                let vis = term_h.saturating_sub(2) as usize;
+                let total = app.log_detail_text.lines().count();
+                let max_start = total.saturating_sub(vis);
+                let step = vis.max(1);
+                app.log_popup_scroll = (app.log_popup_scroll + step).min(max_start);
+                return Ok(false);
+            }
+            KeyCode::Home => {
+                app.log_popup_scroll = 0;
+                return Ok(false);
+            }
+            KeyCode::End => {
+                let (_, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+                let vis = term_h.saturating_sub(2) as usize;
+                let total = app.log_detail_text.lines().count();
+                app.log_popup_scroll = total.saturating_sub(vis);
                 return Ok(false);
             }
             _ => {}
@@ -283,8 +325,14 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
                     if !app.logs_pending_path.is_empty() {
                         let path = app.logs_pending_path.clone();
                         let title = std::path::Path::new(&path).file_name().and_then(|s| s.to_str()).unwrap_or(&path).to_string();
-                        match read_log_file_best_effort(&path, app.logs_sudo_password.as_deref()) {
-                            Ok(text) => { app.log_detail_title = title; app.log_detail_text = text; app.log_popup = true; }
+                        let is_journal = path.starts_with("/var/log/journal");
+                        let res = if is_journal {
+                            read_journal_file_best_effort(&path, app.logs_sudo_password.as_deref())
+                        } else {
+                            read_log_file_best_effort(&path, app.logs_sudo_password.as_deref())
+                        };
+                        match res {
+                            Ok(text) => { app.log_detail_title = title; app.log_detail_text = text; app.log_popup_scroll = 0; app.log_popup = true; }
                             Err(err) => { app.log_detail_title = title; app.log_detail_text = format!("Failed to read: {}", err); app.log_popup = true; }
                         }
                         app.logs_pending_path.clear();
@@ -513,17 +561,68 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
                         Ok(text) => {
                             app.log_detail_title = ent.name.clone();
                             app.log_detail_text = text;
+                            app.log_popup_scroll = 0;
                             app.log_popup = true;
                         }
-                        Err(err) => {
-                            // If error suggests permission denied and no password yet, open prompt
-                            // We cannot reliably parse OS error text; if we have no password, prompt anyway
+                        Err(_err) => {
                             if app.logs_sudo_password.is_none() {
                                 app.logs_pending_path = ent.path.clone();
                                 app.logs_password_prompt = true;
                                 app.logs_password_error.clear();
                             } else {
-                                // Show error in popup
+                                app.log_detail_title = ent.name.clone();
+                                app.log_detail_text = String::from("Failed to read (permission?)");
+                                app.log_popup = true;
+                            }
+                        }
+                    }
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
+    // Selection and actions for Journal tab
+    if app.selected_top_tab == 5 { 
+        match key.code {
+            KeyCode::Up => { if app.journal_selected > 0 { app.journal_selected -= 1; } return Ok(false); }
+            KeyCode::Down => { app.journal_selected = app.journal_selected.saturating_add(1); return Ok(false); }
+            KeyCode::Home => { app.journal_selected = 0; return Ok(false); }
+            KeyCode::End => {
+                let total = list_journal_files().len();
+                if total > 0 { app.journal_selected = total.saturating_sub(1); }
+                return Ok(false);
+            }
+            KeyCode::PageUp => { let step: usize = 10; app.journal_selected = app.journal_selected.saturating_sub(step); return Ok(false); }
+            KeyCode::PageDown => {
+                let step: usize = 10; app.journal_selected = app.journal_selected.saturating_add(step);
+                let total = list_journal_files().len();
+                if total > 0 {
+                    let max_idx = total.saturating_sub(1);
+                    if app.journal_selected > max_idx { app.journal_selected = max_idx; }
+                }
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                // Build file list and attempt to read selected journal file
+                let files = list_journal_files();
+                if !files.is_empty() {
+                    let idx = app.journal_selected.min(files.len().saturating_sub(1));
+                    let ent = &files[idx];
+                    match read_journal_file_best_effort(&ent.path, app.logs_sudo_password.as_deref()) {
+                        Ok(text) => {
+                            app.log_detail_title = ent.name.clone();
+                            app.log_detail_text = text;
+                            app.log_popup_scroll = 0;
+                            app.log_popup = true;
+                        }
+                        Err(err) => {
+                            if app.logs_sudo_password.is_none() {
+                                app.logs_pending_path = ent.path.clone();
+                                app.logs_password_prompt = true;
+                                app.logs_password_error.clear();
+                            } else {
                                 app.log_detail_title = ent.name.clone();
                                 app.log_detail_text = format!("Failed to read: {}", err);
                                 app.log_popup = true;
@@ -548,7 +647,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
         (KeyCode::F(3), _) => { app.selected_top_tab = 1; } // F3 top/htop
         (KeyCode::F(4), _) => { app.selected_top_tab = 2; } // F4 Services (SystemD)
         (KeyCode::F(5), _) => { app.selected_top_tab = 4; } // F5 Logs
-        // F6 intentionally left unmapped
+        (KeyCode::F(6), _) => { app.selected_top_tab = 5; } // F6 Journal
         (KeyCode::F(11), _) => { /* intentionally unmapped */ }
         (KeyCode::F(12), _) => { app.selected_top_tab = 3; } // F12 Shell tab
         // Top tabs navigation (Left/Right, Tab/BackTab, number keys)
@@ -556,7 +655,7 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
         (KeyCode::Right, _) => {
-            if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
+            if app.selected_top_tab < 5 { app.selected_top_tab += 1; }
         }
         // Vim-style: h = left, l = right
         (KeyCode::Char('h'), _) => {
@@ -566,22 +665,23 @@ fn handle_key(key: KeyEvent, app: &mut App) -> Result<bool, Box<dyn Error>> {
             if app.selected_top_tab > 0 { app.selected_top_tab -= 1; }
         }
         (KeyCode::Char('l'), _) => {
-            if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
+            if app.selected_top_tab < 5 { app.selected_top_tab += 1; }
         }
         (KeyCode::Char('L'), _) => {
-            if app.selected_top_tab < 4 { app.selected_top_tab += 1; }
+            if app.selected_top_tab < 5 { app.selected_top_tab += 1; }
         }
         (KeyCode::Tab, _) => {
-            app.selected_top_tab = (app.selected_top_tab + 1) % 5;
+            app.selected_top_tab = (app.selected_top_tab + 1) % 6;
         }
         (KeyCode::BackTab, _) => {
-            app.selected_top_tab = (app.selected_top_tab + 4) % 5; // -1 mod 5
+            app.selected_top_tab = (app.selected_top_tab + 5) % 6; // -1 mod 6
         }
         (KeyCode::Char('1'), _) => { app.selected_top_tab = 0; }
         (KeyCode::Char('2'), _) => { app.selected_top_tab = 1; }
         (KeyCode::Char('3'), _) => { app.selected_top_tab = 2; }
         (KeyCode::Char('4'), _) => { app.selected_top_tab = 3; }
         (KeyCode::Char('5'), _) => { app.selected_top_tab = 4; }
+        (KeyCode::Char('6'), _) => { app.selected_top_tab = 5; }
         _ => {}
     }
 
@@ -1336,6 +1436,55 @@ fn list_var_log_files() -> Vec<LogEntry> {
     out
 }
 
+fn list_journal_files() -> Vec<LogEntry> {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    let root = Path::new("/var/log/journal");
+    let mut out: Vec<LogEntry> = Vec::new();
+    if !root.exists() { return out; }
+    let mut stack: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = fs::read_dir(root) {
+        for ent in rd.flatten() {
+            stack.push(ent.path());
+        }
+    } else {
+        return out;
+    }
+    while let Some(p) = stack.pop() {
+        let md = match fs::symlink_metadata(&p) { Ok(m) => m, Err(_) => continue };
+        if md.is_file() {
+            let name = match p.strip_prefix(root) {
+                Ok(rel) => rel.to_string_lossy().to_string(),
+                Err(_) => p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string_lossy().to_string()),
+            };
+            let size = md.len();
+            let mstr = md.modified().ok().map(fmt_system_time).unwrap_or_else(|| String::from("-"));
+            out.push(LogEntry { name, path: p.to_string_lossy().to_string(), size, modified: mstr });
+        } else if md.is_dir() {
+            if md.file_type().is_symlink() { continue; }
+            if let Ok(rd) = fs::read_dir(&p) {
+                for ent in rd.flatten() {
+                    stack.push(ent.path());
+                }
+            }
+        } else if md.file_type().is_symlink() {
+            if let Ok(target_md) = fs::metadata(&p) {
+                if target_md.is_file() {
+                    let name = match p.strip_prefix(root) {
+                        Ok(rel) => rel.to_string_lossy().to_string(),
+                        Err(_) => p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string_lossy().to_string()),
+                    };
+                    let size = target_md.len();
+                    let mstr = target_md.modified().ok().map(fmt_system_time).unwrap_or_else(|| String::from("-"));
+                    out.push(LogEntry { name, path: p.to_string_lossy().to_string(), size, modified: mstr });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 fn fmt_system_time(st: std::time::SystemTime) -> String {
     use std::time::UNIX_EPOCH;
     match st.duration_since(UNIX_EPOCH) {
@@ -1411,6 +1560,71 @@ fn read_log_file_best_effort(path: &str, sudo_pass: Option<&str>) -> Result<Stri
             return Err(format!("{}", e));
         }
     }
+}
+
+fn read_journal_file_best_effort(path: &str, sudo_pass: Option<&str>) -> Result<String, String> {
+    // Use journalctl to read entries from a specific journal file.
+    // Try without sudo first.
+    let output_res = Command::new("journalctl")
+        .arg("--file").arg(path)
+        .arg("-n").arg("5000")
+        .arg("-o").arg("short-iso")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    let need_sudo = match output_res {
+        Ok(out) => {
+            if out.status.success() {
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                cap_log_text(&mut text);
+                return Ok(text);
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                if err.to_ascii_lowercase().contains("permission") && sudo_pass.is_some() {
+                    true
+                } else {
+                    return Err(if err.trim().is_empty() { String::from("journalctl failed") } else { err });
+                }
+            }
+        }
+        Err(e) => {
+            return Err(format!("Failed to run journalctl: {}", e));
+        }
+    };
+
+    if need_sudo {
+        if let Some(pw) = sudo_pass {
+            let mut child = match Command::new("sudo")
+                .arg("-S")
+                .arg("--")
+                .arg("journalctl")
+                .arg("--file").arg(path)
+                .arg("-n").arg("5000")
+                .arg("-o").arg("short-iso")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn() {
+                    Ok(c) => c,
+                    Err(spawn_err) => return Err(format!("Failed to spawn sudo: {}", spawn_err)),
+                };
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(pw.as_bytes());
+                let _ = stdin.write_all(b"\n");
+            }
+            let out = child.wait_with_output().map_err(|e| format!("sudo error: {}", e))?;
+            if out.status.success() {
+                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                cap_log_text(&mut text);
+                return Ok(text);
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr).into_owned();
+                return Err(if err.trim().is_empty() { String::from("sudo journalctl failed") } else { err });
+            }
+        }
+    }
+    Err(String::from("Unable to read journal (no sudo password provided)"))
 }
 
 fn cap_log_text(s: &mut String) {
@@ -1573,18 +1787,19 @@ fn draw_header(
     let disks_block_height: u16 = (disks.len() as u16 + 1 + 2).max(3); // header + rows + borders
     let proc_block_height: u16 = 12; // Process frame fixed height (inner ~10 rows) + borders
 
-    // Decide current top content height based on selected tab (0 = Dashboard, 1 = top/htop, 2 = Services, 4 = Logs)
+    // Decide current top content height based on selected tab (0 = Dashboard, 1 = top/htop, 2 = Services, 3 = Shell, 4 = Logs, 5 = Journal)
     let top_content_height = match app.selected_top_tab {
         0 => top_frames_height + gfx_height + disks_block_height + proc_block_height,
         1 => cpu_height,
         2 => cpu_height.max(5), // Services tab height (min)
         3 => cpu_height.max(5), // Shell tab height (min)
         4 => cpu_height.max(5), // Logs tab height (min)
+        5 => cpu_height.max(5), // Journal tab height (min)
         _ => cpu_height,
     };
 
     // Layout: remove visual top Tabs bar and use full area for content for known tabs
-    let constraints = if matches!(app.selected_top_tab, 0 | 1 | 2 | 3 | 4) {
+    let constraints = if matches!(app.selected_top_tab, 0 | 1 | 2 | 3 | 4 | 5) {
         [
             Constraint::Min(5),    // content fills remaining space
         ]
@@ -2582,6 +2797,55 @@ fn draw_header(
             .block(Block::default());
             f.render_widget(table, inner);
         }
+    } else if app.selected_top_tab == 5 {
+        // Journal tab
+        let block = Block::default().borders(Borders::ALL).title(" Journal ");
+        f.render_widget(block, top_area);
+        let inner = Rect { x: top_area.x + 1, y: top_area.y + 1, width: top_area.width.saturating_sub(2), height: top_area.height.saturating_sub(2) };
+        if inner.width > 0 && inner.height > 0 {
+            let files = list_journal_files();
+            let total = files.len();
+            let selected = app.journal_selected.min(total.saturating_sub(1));
+            let rows_per_page = inner.height.saturating_sub(1) as usize;
+            let max_start = total.saturating_sub(rows_per_page);
+            let mut start = app.journal_scroll.min(max_start);
+            if selected < start { start = selected; }
+            if rows_per_page > 0 && selected >= start + rows_per_page { start = selected + 1 - rows_per_page; }
+            // Header
+            let header = Row::new(vec![
+                Cell::from(Span::styled("NAME", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("SIZE", Style::default().add_modifier(Modifier::BOLD))),
+                Cell::from(Span::styled("MODIFIED", Style::default().add_modifier(Modifier::BOLD))),
+            ]);
+            let mut rows: Vec<Row> = Vec::new();
+            for (i, ent) in files.into_iter().skip(start).take(rows_per_page).enumerate() {
+                let mut row = Row::new(vec![
+                    Cell::from(Span::raw(ent.name)),
+                    Cell::from(Span::raw(fmt_bytes(ent.size))),
+                    Cell::from(Span::raw(ent.modified)),
+                ]);
+                if start + i == selected { row = row.style(Style::default().add_modifier(Modifier::REVERSED)); }
+                rows.push(row);
+            }
+            if rows.is_empty() {
+                rows.push(Row::new(vec![
+                    Cell::from(Span::raw("No journal files.")),
+                    Cell::from(Span::raw("")),
+                    Cell::from(Span::raw("")),
+                ]));
+            }
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Min(10),
+                    Constraint::Length(12),
+                    Constraint::Length(16),
+                ],
+            )
+            .header(header)
+            .block(Block::default());
+            f.render_widget(table, inner);
+        }
     }
 }
 
@@ -2607,6 +2871,7 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let top_active = app.selected_top_tab == 1;
     let services_active = app.selected_top_tab == 2;
     let logs_active = app.selected_top_tab == 4;
+    let journal_active = app.selected_top_tab == 5;
     let shell_active = app.selected_top_tab == 3;
 
     let text = Line::from(vec![
@@ -2624,7 +2889,9 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         // F5 Logs
         Span::styled(" F5 ", if logs_active { key_style_active } else { key_style }),
         Span::styled(" Logs  ", if logs_active { hint_style_active } else { hint_style }),
-        Span::styled(" F6 ", key_style), Span::styled("        ", hint_style),
+        // F6 Journal
+        Span::styled(" F6 ", if journal_active { key_style_active } else { key_style }),
+        Span::styled(" Journal  ", if journal_active { hint_style_active } else { hint_style }),
         Span::styled(" F7 ", key_style), Span::styled("        ", hint_style),
         Span::styled(" F8 ", key_style), Span::styled("        ", hint_style),
         Span::styled(" F9 ", key_style), Span::styled("        ", hint_style),
@@ -2642,237 +2909,11 @@ fn draw_menu(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
 
 // Help popup drawing (F1)
-/// Draw the F1 Help popup with multiline content and a cyan border + shadow.
-fn draw_help_popup(f: &mut ratatui::Frame<'_>, size: Rect) {
-    // Build help text lines (multiline with indentation)
-    let lines = vec![
-        Line::from(Span::raw(format!("{} v {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))),
-        Line::from(Span::raw(format!("© {} {}", env!("RTOP_COPYRIGHT_YEAR"), env!("CARGO_PKG_AUTHORS")))), 
-        Line::from(Span::raw(format!("License: {}", env!("CARGO_PKG_LICENSE")))),
-        Line::from(Span::raw(" ")),
-        Line::from(Span::raw("Navigation and hotkeys:")),
-        Line::from(Span::raw("    - Switch tabs: Left/Right, h/l, Tab/BackTab, or 1/2/3/4/5.")),
-        Line::from(Span::raw("    - In tables (Processes/Services/Logs): Home/End jump to first/last; PgUp/PgDn move by 10.")),
-        Line::from(Span::raw("    - F2 Dashboard, F3 top/htop, F4 Services (SystemD), F5 Logs, F12 Shell (embedded PTY).")),
-        Line::from(Span::raw("    - In Shell tab: keys go to your shell; Ctrl-C is sent to the shell (F10 exits app).")), 
-        Line::from(Span::raw("    - F10 exit app; q also exits.")), 
-    ];
-
-    // Compute popup width: max text width + 1 space padding + 4 (borders)
-    // Use Line::width() to account for unicode character widths.
-    let max_text_width: u16 = lines
-        .iter()
-        .map(|l| l.width() as u16)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1); // left pad of 1 space for all rows
-    let mut popup_w: u16 = max_text_width.saturating_add(4);
-    if popup_w > size.width { popup_w = size.width; }
-
-    // Dynamic height based on number of lines (+2 for borders)
-    let mut popup_h: u16 = (lines.len() as u16).saturating_add(2);
-    if popup_h > size.height { popup_h = size.height; }
-
-    // Center the popup
-    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
-    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
-    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
-
-    // Draw shadow first: offset by (1,1), clamped to screen
-    let sx = area.x.saturating_add(1);
-    let sy = area.y.saturating_add(1);
-    if sx < size.x + size.width && sy < size.y + size.height {
-        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
-        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
-        if sw > 0 && sh > 0 {
-            let shadow = Rect { x: sx, y: sy, width: sw, height: sh };
-            let shadow_block = Block::default().style(Style::default().bg(Color::Black));
-            f.render_widget(shadow_block, shadow);
-        }
-    }
-
-    // Clear and border for the main popup
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Help ")
-        .border_style(Style::default().fg(Color::Cyan));
-    f.render_widget(block, area);
-
-    // Inner text area
-    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
-    // Prepend one leading space to every rendered line
-    let padded_lines: Vec<Line> = lines
-        .into_iter()
-        .map(|l| {
-            let mut spans = vec![Span::raw(" ")];
-            spans.extend(l.spans);
-            Line::from(spans)
-        })
-        .collect();
-    let paragraph = ratatui::widgets::Paragraph::new(padded_lines);
-    f.render_widget(paragraph, inner);
-}
-
-/// Draw the Service Details popup with a dynamic title and multi-line body text.
-fn draw_service_popup(f: &mut ratatui::Frame<'_>, size: Rect, title: &str, text: &str) {
-    // Split text into lines and measure width
-    let lines_raw: Vec<&str> = text.split('\n').collect();
-    let max_text_width: u16 = lines_raw.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0).saturating_add(1);
-    // Add some padding and clamp to screen bounds
-    let mut popup_w: u16 = max_text_width.saturating_add(4);
-    if popup_w > size.width { popup_w = size.width; }
-    // Height is based on number of lines (capped to screen)
-    let mut popup_h: u16 = (lines_raw.len() as u16).saturating_add(2);
-    if popup_h > size.height { popup_h = size.height; }
-
-    // Center the popup
-    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
-    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
-    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
-
-    // Shadow
-    let sx = area.x.saturating_add(1);
-    let sy = area.y.saturating_add(1);
-    if sx < size.x + size.width && sy < size.y + size.height {
-        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
-        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
-        if sw > 0 && sh > 0 {
-            let shadow = Rect { x: sx, y: sy, width: sw, height: sh };
-            let shadow_block = Block::default().style(Style::default().bg(Color::Black));
-            f.render_widget(shadow_block, shadow);
-        }
-    }
-
-    // Border and clear
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Service: {} ", title))
-        .border_style(Style::default().fg(Color::Green));
-    f.render_widget(block, area);
-
-    // Inner text area
-    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
-    let lines: Vec<Line> = lines_raw.into_iter().map(|l| Line::from(Span::raw(format!(" {}", l)))).collect();
-    let paragraph = ratatui::widgets::Paragraph::new(lines);
-    f.render_widget(paragraph, inner);
-}
 
 
 
-/// Draw the Process Details popup with a dynamic title and multi-line body text.
-fn draw_process_popup(f: &mut ratatui::Frame<'_>, size: Rect, title: &str, text: &str) {
-    // Split text into lines and measure width
-    let lines_raw: Vec<&str> = text.split('\n').collect();
-    let max_text_width: u16 = lines_raw.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0).saturating_add(1);
-    // Add some padding and clamp to screen bounds
-    let mut popup_w: u16 = max_text_width.saturating_add(4);
-    if popup_w > size.width { popup_w = size.width; }
-    // Height is based on number of lines (capped to screen)
-    let mut popup_h: u16 = (lines_raw.len() as u16).saturating_add(2);
-    if popup_h > size.height { popup_h = size.height; }
 
-    // Center the popup
-    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
-    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
-    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
 
-    // Shadow
-    let sx = area.x.saturating_add(1);
-    let sy = area.y.saturating_add(1);
-    if sx < size.x + size.width && sy < size.y + size.height {
-        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
-        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
-        if sw > 0 && sh > 0 {
-            let shadow = Rect { x: sx, y: sy, width: sw, height: sh };
-            let shadow_block = Block::default().style(Style::default().bg(Color::Black));
-            f.render_widget(shadow_block, shadow);
-        }
-    }
 
-    // Border and clear
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" Process: {} ", title))
-        .border_style(Style::default().fg(Color::Yellow));
-    f.render_widget(block, area);
-
-    // Inner text area
-    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
-    let lines: Vec<Line> = lines_raw.into_iter().map(|l| Line::from(Span::raw(format!(" {}", l)))).collect();
-    let paragraph = ratatui::widgets::Paragraph::new(lines);
-    f.render_widget(paragraph, inner);
-}
-
-/// Draw the Log Details popup with a dynamic title and multi-line body text.
-fn draw_log_popup(f: &mut ratatui::Frame<'_>, size: Rect, title: &str, text: &str) {
-    // Split text into lines and measure width
-    let lines_raw: Vec<&str> = text.split('\n').collect();
-    let max_text_width: u16 = lines_raw.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0).saturating_add(1);
-    let mut popup_w: u16 = max_text_width.saturating_add(4);
-    if popup_w > size.width { popup_w = size.width; }
-    let mut popup_h: u16 = (lines_raw.len() as u16).saturating_add(2);
-    if popup_h > size.height { popup_h = size.height; }
-    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
-    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
-    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
-    let sx = area.x.saturating_add(1);
-    let sy = area.y.saturating_add(1);
-    if sx < size.x + size.width && sy < size.y + size.height {
-        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
-        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
-        if sw > 0 && sh > 0 { let shadow = Rect { x: sx, y: sy, width: sw, height: sh }; let shadow_block = Block::default().style(Style::default().bg(Color::Black)); f.render_widget(shadow_block, shadow); }
-    }
-    f.render_widget(Clear, area);
-    let block = Block::default().borders(Borders::ALL).title(format!(" Log: {} ", title)).border_style(Style::default().fg(Color::LightBlue));
-    f.render_widget(block, area);
-    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
-    let lines: Vec<Line> = lines_raw.into_iter().map(|l| Line::from(Span::raw(format!(" {}", l)))).collect();
-    let paragraph = ratatui::widgets::Paragraph::new(lines);
-    f.render_widget(paragraph, inner);
-}
-
-/// Draw a sudo password prompt popup for Logs, with masked input and error line.
-fn draw_logs_password_prompt(f: &mut ratatui::Frame<'_>, size: Rect, error_text: &str, chars_len: usize) {
-    let lines = vec![
-        Line::from(Span::raw("Enter sudo password to read protected logs:")),
-        Line::from(Span::raw(" ")), // spacer
-        Line::from(Span::raw("Password: ")), // input line label
-        Line::from(Span::raw(" ")), // spacer
-        Line::from(Span::styled(error_text.to_string(), Style::default().fg(Color::Red))),
-    ];
-    // Fixed width popup
-    let mut popup_w: u16 = 60;
-    if popup_w > size.width { popup_w = size.width; }
-    let mut popup_h: u16 = 7;
-    if popup_h > size.height { popup_h = size.height; }
-    let popup_x = size.x + (size.width.saturating_sub(popup_w)) / 2;
-    let popup_y = size.y + (size.height.saturating_sub(popup_h)) / 2;
-    let area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
-    let sx = area.x.saturating_add(1);
-    let sy = area.y.saturating_add(1);
-    if sx < size.x + size.width && sy < size.y + size.height {
-        let sw = area.width.min((size.x + size.width).saturating_sub(sx));
-        let sh = area.height.min((size.y + size.height).saturating_sub(sy));
-        if sw > 0 && sh > 0 { let shadow = Rect { x: sx, y: sy, width: sw, height: sh }; let shadow_block = Block::default().style(Style::default().bg(Color::Black)); f.render_widget(shadow_block, shadow); }
-    }
-    f.render_widget(Clear, area);
-    let block = Block::default().borders(Borders::ALL).title(" Sudo Password ").border_style(Style::default().fg(Color::Magenta));
-    f.render_widget(block, area);
-    // Inner
-    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
-    let mut display_lines: Vec<Line> = Vec::new();
-    display_lines.push(lines[0].clone());
-    display_lines.push(lines[1].clone());
-    // Render password masked line
-    let masked = "*".repeat(chars_len);
-    display_lines.push(Line::from(Span::raw(format!("Password: {}", masked))));
-    display_lines.push(lines[3].clone());
-    display_lines.push(lines[4].clone());
-    let paragraph = ratatui::widgets::Paragraph::new(display_lines);
-    f.render_widget(paragraph, inner);
-}
 
 

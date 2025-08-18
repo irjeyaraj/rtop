@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is Keep a Changelog–inspired, with dates in YYYY-MM-DD.
 
+## [0.1.7] - 2025-08-18
+- Meta: Bumped version to 0.1.7.
+- Docs: Updated README to include the new Journal tab (F6) and corrected controls (1/2/3/4/5/6); clarified popup scrolling keys for Logs/Journal.
+- Cleanup: Minor maintenance and consistency tidy-ups; build remains warning-free.
+
 ## [0.1.6] - 2025-08-18
 - Clean/Optimize: Minor code tidying; ensured zero warnings on build; small internal refactors only.
 - Docs: Updated README to clarify table navigation and note journal exclusion in Logs.

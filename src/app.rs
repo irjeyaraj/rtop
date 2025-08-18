@@ -37,16 +37,20 @@ pub struct App {
     // Logs tab state
     pub logs_scroll: usize,
     pub logs_selected: usize,
-    // Log content popup state
+    // Journal tab state
+    pub journal_scroll: usize,
+    pub journal_selected: usize,
+    // Log content popup state (reused for Journal)
     pub log_popup: bool,
     pub log_detail_title: String,
     pub log_detail_text: String,
-    // Sudo password prompt state for Logs
+    pub log_popup_scroll: usize,
+    // Sudo password prompt state for Logs/Journal
     pub logs_password_prompt: bool,
     pub logs_password_input: String,
     pub logs_password_error: String,
     pub logs_sudo_password: Option<String>,
-    pub logs_pending_path: String, // path awaiting sudo read
+    pub logs_pending_path: String, // path awaiting sudo read (log or journal)
 }
 
 /// Construct the initial application state.
@@ -74,9 +78,12 @@ impl Default for App {
             procs_pids_sorted: Vec::new(),
             logs_scroll: 0,
             logs_selected: 0,
+            journal_scroll: 0,
+            journal_selected: 0,
             log_popup: false,
             log_detail_title: String::new(),
             log_detail_text: String::new(),
+            log_popup_scroll: 0,
             logs_password_prompt: false,
             logs_password_input: String::new(),
             logs_password_error: String::new(),
