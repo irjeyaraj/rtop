@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is Keep a Changelog–inspired, with dates in YYYY-MM-DD.
 
+## [0.1.6] - 2025-08-18
+- Clean/Optimize: Minor code tidying; ensured zero warnings on build; small internal refactors only.
+- Docs: Updated README to clarify table navigation and note journal exclusion in Logs.
+- Meta: Bumped version to 0.1.6.
+
 ## [0.1.5] - 2025-08-18
 - Fix: Removed unused functions (run_command_capture, draw_command_prompt, draw_command_result_popup) to eliminate compiler warnings.
 - Fix: Removed unnecessary mutable variables and dead code warnings.

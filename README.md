@@ -12,7 +12,7 @@ Press F1 in the app to see a concise Help popup.
   - Dashboard (F2)
   - top/htop (F3) with scrollable process table and details popup (Enter)
   - Services (SystemD) (F4) with scrollable table and per-row status color; details popup (Enter)
-  - Logs (F5) recursively lists /var/log with Enter-to-open; prompts for sudo password on permission denied
+  - Logs (F5) recursively lists /var/log with Enter-to-open; prompts for sudo password on permission denied (excludes /var/log/journal)
   - Shell (F12) embedded PTY shell
 - Keyboard-driven navigation; runs in a standard terminal
 
